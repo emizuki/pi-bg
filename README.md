@@ -29,14 +29,25 @@ calls, which is the whole point:
 bg_start "npm run dev"        -> Started b00f2c2a (npm)
 bg_list                       -> b00f2c2a  npm  running 4s
 bg_logs  b00f2c2a             -> the output so far
-bg_stop  b00f2c2a             -> b00f2c2a  npm  exited SIGTERM after 8s
+bg_stop  b00f2c2a             -> Stopping b00f2c2a (npm).
 ```
 
 `keepAlive` is off by default, so a process is stopped when the session ends. An orphaned server
 holding a port is harder to find than it is to restart. Pass `keepAlive: true` to detach one
 deliberately.
 
+Stopping signals the process **group**, not just the shell pi spawned. With `shell: true` a
+command containing any shell operator — `cd app && npm run dev` — runs as a grandchild, and
+signalling the wrapper alone would leave the server running while this tool reported it stopped.
+At session shutdown the escalation to SIGKILL is immediate rather than graceful, because a
+graceful one runs on a timer that an exiting process never reaches.
+
+A command ending in `&` is rejected: backgrounding is what this tool does, and a self-backgrounding
+command exits at once, leaving the real process untracked.
+
 An unexpected exit is announced; a process you stopped yourself is not, because that is not news.
+The distinction is whether this tool asked for the exit, not which signal arrived, so a process
+killed by the OOM killer or from another terminal still gets reported.
 
 ## Waiting for something outside the session
 
@@ -65,13 +76,15 @@ possible behaviour.
   answer there, so a notification would arrive after the process was gone — this was observed,
   not assumed. `pi -p "wait for CI, then deploy"` therefore does what it says.
 
-Notifications are coalesced over a short window, so five things finishing together wake the
-session once rather than five times.
+Notifications are collected into a single wake-up over a short window, so five things finishing
+together produce one turn rather than five.
 
 ## Cleanup
 
 Logs live in a directory named after the pi process that owns them. It is removed at session
-shutdown, and any directory whose owning process is gone is swept at startup.
+shutdown, and any directory whose owning process is gone is swept at startup. Only the last 64 KB
+of a log is ever read, so a chatty server does not make `bg_list` expensive, and the most recent
+twenty exited entries are kept for `bg_logs` before older ones are discarded.
 
 The second half matters: a killed process never runs its shutdown handler, and cleanup that
 depends on a single event is cleanup that silently stops happening. Liveness is checked with
@@ -82,3 +95,14 @@ depends on a single event is cleanup that silently stops happening. Liveness is 
 `./check.sh` type-checks for unresolved identifiers. `bun build` only transpiles and will happily
 emit a call to a function that does not exist, so it is not a substitute; the script refuses to
 pass if `tsc` is missing rather than reporting success it could not verify.
+
+## Known limits
+
+State is module-scoped and teardown is per-session. If pi ever activates this extension for more
+than one session inside a single process, they would share the process table, the watch table and
+the log directory, and one session's shutdown would stop the other's work. Whether that is
+reachable depends on pi's host behaviour, which has not been verified here.
+
+`bg_watch` runs its first poll before returning, in both modes, so a slow poll command delays even
+the interactive "returns immediately" path by that one poll. The poll is capped at the watch
+interval, so the delay is bounded rather than open-ended.

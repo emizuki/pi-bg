@@ -6,9 +6,10 @@
  * Both are process problems rather than agent problems, so they live here instead of inside a
  * subagent package.
  *
- * Nothing here blocks a turn. `bg_start` returns as soon as the child is spawned, and `bg_watch`
- * polls inside the extension and pushes the result back with `sendMessage`, which is what lets a
- * session carry on working while it waits.
+ * `bg_start` returns as soon as the child is spawned. `bg_watch` polls inside the extension, so
+ * waiting never costs a model turn; in an interactive session it returns immediately and pushes
+ * the outcome back with `sendMessage`, and in print mode — which exits with its answer, leaving
+ * nowhere for a notification to land — it waits inside the tool call instead.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -40,6 +41,9 @@ interface BgProcess {
 	exitCode?: number | null;
 	signal?: NodeJS.Signals | null;
 	keepAlive: boolean;
+	/** Set by terminate(), so an exit we caused is distinguishable from one we did not. */
+	stopping: boolean;
+	logFd?: number;
 	child: ChildProcess;
 }
 
@@ -54,12 +58,27 @@ interface BgWatch {
 	startedAt: number;
 	polls: number;
 	lastPollAt: number;
+	finishedAt?: number;
 	state: "watching" | "met" | "timeout" | "cancelled";
 	lastOutput: string;
 	timer?: ReturnType<typeof setInterval>;
 }
 
 const running = new Map<string, BgProcess>();
+/** Exited entries are kept so bg_logs still works, but not forever. */
+const MAX_REMEMBERED_EXITS = 20;
+
+function pruneExited(): void {
+	const exited = [...running.values()].filter((entry) => !isAlive(entry)).sort((a, b) => (a.exitedAt ?? 0) - (b.exitedAt ?? 0));
+	for (const entry of exited.slice(0, Math.max(0, exited.length - MAX_REMEMBERED_EXITS))) {
+		running.delete(entry.id);
+		try {
+			fs.rmSync(entry.logFile, { force: true });
+		} catch {
+			/* ignore */
+		}
+	}
+}
 const watches = new Map<string, BgWatch>();
 
 function shortId(): string {
@@ -118,12 +137,36 @@ function elapsed(from: number, to = Date.now()): string {
 	return minutes < 60 ? `${minutes}m${seconds % 60}s` : `${Math.floor(minutes / 60)}h${minutes % 60}m`;
 }
 
+/**
+ * Read the tail of a log without loading the whole file.
+ *
+ * A dev server's log grows without bound; reading it whole on every `bg_list` is O(file), and past
+ * V8's maximum string length it throws — which a bare catch would turn into "(no output yet)",
+ * silently hiding a busy process's output rather than reporting a problem.
+ */
+const TAIL_BYTES = 64 * 1024;
+
 function tailFile(file: string, lines: number): string {
 	let text: string;
+	let fd: number | undefined;
 	try {
-		text = fs.readFileSync(file, "utf8");
+		fd = fs.openSync(file, "r");
+		const size = fs.fstatSync(fd).size;
+		const start = Math.max(0, size - TAIL_BYTES);
+		const bytes = Buffer.alloc(Math.min(size, TAIL_BYTES));
+		fs.readSync(fd, bytes, 0, bytes.length, start);
+		text = bytes.toString("utf8");
+		// A partial read can start mid-line; drop the fragment rather than show half a line.
+		if (start > 0) text = text.slice(text.indexOf("\n") + 1);
 	} catch {
 		return "(no output yet)";
+	} finally {
+		if (fd !== undefined)
+			try {
+				fs.closeSync(fd);
+			} catch {
+				/* ignore */
+			}
 	}
 	const all = text.split("\n").filter((line, index, arr) => line !== "" || index < arr.length - 1);
 	return all.length <= lines ? all.join("\n") || "(no output yet)" : all.slice(-lines).join("\n");
@@ -138,15 +181,49 @@ function describeProcess(entry: BgProcess): string {
 }
 
 function describeWatch(watch: BgWatch): string {
-	return `${watch.id}  ${watch.label}  ${watch.state}  ${watch.polls} polls over ${elapsed(watch.startedAt)}\n  $ ${watch.command}`;
+	// Against finishedAt, or a watch that met its condition in 30s reads as "over 4h" once the
+	// session has been open that long.
+	return `${watch.id}  ${watch.label}  ${watch.state}  ${watch.polls} polls over ${elapsed(watch.startedAt, watch.finishedAt)}\n  $ ${watch.command}`;
 }
 
-/** Terminate a child, escalating only if it is still there. `killed` means "signal sent". */
-function terminate(entry: BgProcess): void {
-	if (!isAlive(entry)) return;
-	entry.child.kill("SIGTERM");
+/**
+ * Signal a child's whole process group.
+ *
+ * `shell: true` means the child is `/bin/sh -c "<command>"`, and sh only exec-optimises a command
+ * with no shell operators. `cd app && npm run dev` therefore runs as a grandchild, and signalling
+ * the shell alone leaves it reparented to init, still holding its port, while this extension
+ * reports the entry as stopped. Every child is spawned `detached`, which puts it in its own group,
+ * so a negative pid reaches the workload rather than only its wrapper.
+ */
+function signalGroup(entry: BgProcess, sig: NodeJS.Signals): void {
+	const pid = entry.child.pid;
+	if (pid === undefined) return;
+	try {
+		process.kill(-pid, sig);
+	} catch {
+		// Group already gone, or never created; fall back to the child itself.
+		try {
+			entry.child.kill(sig);
+		} catch {
+			/* already dead */
+		}
+	}
+}
+
+/**
+ * Terminate a child. `immediate` escalates without waiting, for shutdown: the grace period runs on
+ * a timer, and a synchronous shutdown handler in an exiting process never reaches it.
+ */
+function terminate(entry: BgProcess, immediate = false): void {
+	if (!isAlive(entry) || entry.stopping) return;
+	entry.stopping = true;
+	signalGroup(entry, "SIGTERM");
+	if (immediate) {
+		signalGroup(entry, "SIGKILL");
+		return;
+	}
 	const escalate = setTimeout(() => {
-		if (entry.child.exitCode === null && entry.child.signalCode === null) entry.child.kill("SIGKILL");
+		if (entry.child.exitCode === null && entry.child.signalCode === null) signalGroup(entry, "SIGKILL");
 	}, SIGKILL_GRACE_MS);
 	escalate.unref?.();
 	entry.child.once("exit", () => clearTimeout(escalate));
@@ -161,21 +238,49 @@ export default function (pi: ExtensionAPI) {
 	 * once, not once each. `followUp` waits for the current turn's tools to finish, and
 	 * `triggerTurn` is what makes an idle session pick the result up instead of sitting on it.
 	 */
-	function notify(key: string, content: string) {
-		const existing = pendingNudges.get(key);
-		if (existing) clearTimeout(existing);
-		pendingNudges.set(
-			key,
-			setTimeout(() => {
-				pendingNudges.delete(key);
-				pi.sendMessage({ customType: "pi-bg", content, display: true }, { deliverAs: "followUp", triggerTurn: true });
-			}, NUDGE_HOLD_MS),
-		);
+	let pendingLines: string[] = [];
+	let nudgeTimer: ReturnType<typeof setTimeout> | undefined;
+
+	/**
+	 * Collect notifications into one wake-up.
+	 *
+	 * Keying the hold by run id coalesced nothing, because each id fires exactly once: five watches
+	 * finishing together meant five timers and five turns. One shared buffer is what actually
+	 * merges them. The timer is unref'd so a pending nudge cannot hold an exiting process open.
+	 */
+	function notify(content: string) {
+		pendingLines.push(content);
+		if (nudgeTimer) clearTimeout(nudgeTimer);
+		nudgeTimer = setTimeout(() => {
+			nudgeTimer = undefined;
+			const body = pendingLines.join("\n\n");
+			pendingLines = [];
+			pi.sendMessage({ customType: "pi-bg", content: body, display: true }, { deliverAs: "followUp", triggerTurn: true });
+		}, NUDGE_HOLD_MS);
+		nudgeTimer.unref?.();
 	}
 
-	function runOnce(command: string, cwd: string): Promise<{ code: number | null; output: string }> {
+	/**
+	 * Run a poll command once, bounded.
+	 *
+	 * Without a cap a hung poll means the deadline is never even evaluated — the loop only checks it
+	 * after a poll returns — so `timeoutMs` silently did nothing and a print-mode call could block
+	 * forever on a stuck `curl`.
+	 */
+	function runOnce(command: string, cwd: string, timeoutMs: number): Promise<{ code: number | null; output: string }> {
 		return new Promise((resolve) => {
-			const child = spawn(command, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] });
+			const child = spawn(command, { cwd, shell: true, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+			const cap = setTimeout(() => {
+				if (child.pid !== undefined) {
+					try {
+						process.kill(-child.pid, "SIGKILL");
+					} catch {
+						child.kill("SIGKILL");
+					}
+				}
+			}, Math.max(1_000, timeoutMs));
+			cap.unref?.();
+			child.once("close", () => clearTimeout(cap));
 			let output = "";
 			const collect = (chunk: Buffer) => {
 				output += chunk.toString();
@@ -207,17 +312,34 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			ensureLogRoot();
 			const id = shortId();
-			const cwd = params.cwd ?? ctx.cwd;
+			// Resolved against the session's cwd, which is what the parameter description promises;
+			// spawn would otherwise resolve a relative path against pi's own process cwd.
+			const cwd = params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd;
 			const logFile = path.join(LOG_ROOT, `${id}.log`);
 			const out = fs.openSync(logFile, "a");
 			const keepAlive = params.keepAlive === true;
+			// `cmd &` makes sh exit 0 at once, so the entry is marked exited while the real work is
+			// untracked and unstoppable. Backgrounding is this tool's job; say so rather than lie.
+			if (/&\s*$/.test(params.command.trim())) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Drop the trailing '&': bg_start already runs the command in the background, and a self-backgrounding command exits immediately, leaving the real process untracked.",
+						},
+					],
+					isError: true,
+				};
+			}
 			const child = spawn(params.command, {
 				cwd,
 				shell: true,
-				detached: keepAlive,
+				// Always its own process group, so terminate() can reach a grandchild. unref always
+				// too: a background process must never be the reason pi cannot exit.
+				detached: true,
 				stdio: ["ignore", out, out],
 			});
-			if (keepAlive) child.unref();
+			child.unref();
 
 			const entry: BgProcess = {
 				id,
@@ -227,30 +349,46 @@ export default function (pi: ExtensionAPI) {
 				logFile,
 				startedAt: Date.now(),
 				keepAlive,
+				stopping: false,
+				logFd: out,
 				child,
 			};
 			running.set(id, entry);
+			pruneExited();
 
-			child.on("error", (error) => {
-				entry.exitedAt = Date.now();
-				entry.exitCode = null;
-				fs.appendFileSync(logFile, `\n[pi-bg] failed to start: ${error.message}\n`);
-				notify(`proc:${id}`, `Background process ${id} (${entry.name}) failed to start: ${error.message}`);
-			});
-			child.on("exit", (code, signal) => {
-				entry.exitedAt = Date.now();
-				entry.exitCode = code;
-				entry.signal = signal;
+			const closeLog = () => {
+				if (entry.logFd === undefined) return;
 				try {
-					fs.closeSync(out);
+					fs.closeSync(entry.logFd);
 				} catch {
 					/* already closed */
 				}
-				// Only unexpected deaths are worth a turn; a process you stopped is not news.
-				if (signal !== "SIGTERM" && signal !== "SIGKILL") {
+				entry.logFd = undefined;
+			};
+
+			child.on("error", (error) => {
+				entry.exitedAt ??= Date.now();
+				entry.exitCode = null;
+				closeLog();
+				fs.appendFileSync(logFile, `\n[pi-bg] failed to start: ${error.message}\n`);
+				notify(`Background process ${id} (${entry.name}) failed to start: ${error.message}`);
+			});
+			// `close` rather than `exit`: a spawn that fails emits error and close but never exit, so
+			// closing the log there leaked a descriptor on every failed start.
+			child.on("close", (code, signal) => {
+				entry.exitedAt ??= Date.now();
+				if (entry.exitCode === undefined) entry.exitCode = code;
+				entry.signal = signal;
+				closeLog();
+				// Keyed on whether we asked for it, not on which signal arrived: an OOM kill or a
+				// `kill` from another terminal is exactly the unexpected death worth reporting.
+				if (!entry.stopping && code !== null) {
 					notify(
-						`proc:${id}`,
 						`Background process ${id} (${entry.name}) exited ${signal ?? code} after ${elapsed(entry.startedAt, entry.exitedAt)}.\nLast output:\n${tailFile(logFile, 10)}`,
+					);
+				} else if (!entry.stopping && signal) {
+					notify(
+						`Background process ${id} (${entry.name}) was killed by ${signal} after ${elapsed(entry.startedAt, entry.exitedAt)}.\nLast output:\n${tailFile(logFile, 10)}`,
 					);
 				}
 			});
@@ -313,7 +451,11 @@ export default function (pi: ExtensionAPI) {
 			const watch = watches.get(params.id);
 			if (watch) {
 				if (watch.timer) clearInterval(watch.timer);
-				watch.state = watch.state === "watching" ? "cancelled" : watch.state;
+				if (watch.state !== "watching") {
+					return { content: [{ type: "text", text: `Watch ${watch.id} already ${watch.state}.` }] };
+				}
+				watch.state = "cancelled";
+				watch.finishedAt = Date.now();
 				return { content: [{ type: "text", text: `Cancelled watch ${watch.id}.` }] };
 			}
 			const entry = running.get(params.id);
@@ -369,7 +511,7 @@ export default function (pi: ExtensionAPI) {
 				id,
 				label: params.label ?? "condition",
 				command: params.command,
-				cwd: params.cwd ?? ctx.cwd,
+				cwd: params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd,
 				until: params.until,
 				intervalMs,
 				deadline: Date.now() + (params.timeoutMs ?? DEFAULT_WATCH_TIMEOUT_MS),
@@ -383,9 +525,13 @@ export default function (pi: ExtensionAPI) {
 
 			let polling = false;
 			const finish = (state: BgWatch["state"], message: string) => {
+				// A poll already in flight when the watch was cancelled must not resurrect it into
+				// "met" and announce a result nobody is waiting for.
+				if (watch.state !== "watching") return;
 				watch.state = state;
+				watch.finishedAt = Date.now();
 				if (watch.timer) clearInterval(watch.timer);
-				notify(`watch:${id}`, message);
+				if (ctx.hasUI) notify(message);
 			};
 			const poll = async () => {
 				// A slow command must not stack up behind itself; skip rather than queue.
@@ -393,7 +539,7 @@ export default function (pi: ExtensionAPI) {
 				polling = true;
 				try {
 					watch.lastPollAt = Date.now();
-					const { code, output } = await runOnce(watch.command, watch.cwd);
+					const { code, output } = await runOnce(watch.command, watch.cwd, watch.intervalMs);
 					watch.polls++;
 					watch.lastOutput = output.slice(-4_000);
 					const met = pattern ? pattern.test(output) : code === 0;
@@ -417,6 +563,25 @@ export default function (pi: ExtensionAPI) {
 			// discover that is the most annoying possible behaviour.
 			await poll();
 
+			// The first poll can settle it, and the comment above says that is the common case.
+			// Falling through would arm an interval on a finished watch and answer "watching" for
+			// something already met, with a contradicting notification arriving moments later.
+			if (watch.state !== "watching") {
+				watches.delete(id);
+				const settled = watch.state === "met";
+				return {
+					content: [
+						{
+							type: "text",
+							text: settled
+								? `Already true: ${watch.label}.\n${watch.lastOutput.slice(-1_500)}`
+								: `Watch ${watch.state} immediately for ${watch.label}.\n${watch.lastOutput.slice(-1_500)}`,
+						},
+					],
+					isError: !settled,
+				};
+			}
+
 			// A session with no UI has no later. `-p` exits with its answer, so a notification
 			// arrives after the process is gone — observed, not assumed. There the only place the
 			// result can be delivered is this tool call, so wait in it.
@@ -424,6 +589,8 @@ export default function (pi: ExtensionAPI) {
 				while (watch.state === "watching") {
 					if (signal?.aborted) {
 						watch.state = "cancelled";
+						watch.finishedAt = Date.now();
+						watches.delete(id);
 						return { content: [{ type: "text", text: `Watch ${id} aborted.` }], isError: true };
 					}
 					await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, 1_000)));
@@ -461,6 +628,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		for (const watch of watches.values()) if (watch.timer) clearInterval(watch.timer);
 		watches.clear();
+		if (nudgeTimer) clearTimeout(nudgeTimer);
+		pendingLines = [];
 		let survivors = 0;
 		for (const entry of running.values()) {
 			// keepAlive is the whole point of keepAlive: leave those running.
@@ -468,7 +637,9 @@ export default function (pi: ExtensionAPI) {
 				survivors++;
 				continue;
 			}
-			terminate(entry);
+			// Immediate: the graceful escalation runs on a timer, and an exiting process never
+			// reaches it, so a child that ignores SIGTERM would outlive the session it belongs to.
+			terminate(entry, true);
 		}
 		running.clear();
 		// Logs of a process that is still running are still being written to; everything else is

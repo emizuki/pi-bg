@@ -93,10 +93,19 @@ interface BgWatch {
 /** Exited entries are kept so bg_logs still works, but not forever. */
 const MAX_REMEMBERED_EXITS = 20;
 
+interface ProcessGroupMetadata {
+	pgid: number;
+	/** Linux process start ticks; null means the group cannot be reclaimed safely after a crash. */
+	identity: string | null;
+}
+
 interface LogRootMetadata {
+	version: 1;
 	ownerPid: number;
-	keepAliveGroups: number[];
+	keepAliveGroups: ProcessGroupMetadata[];
+	managedGroups: ProcessGroupMetadata[];
 	pendingKeepAlive: string[];
+	pendingManaged: string[];
 }
 
 function shortId(): string {
@@ -122,16 +131,53 @@ function isProcessGroupIdAlive(pgid: number): boolean {
 	}
 }
 
+function processBirthIdentity(pid: number): string | null {
+	if (process.platform !== "linux") return null;
+	try {
+		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+		// Everything after the final ')' starts at field 3; Linux starttime is field 22.
+		const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+		const startTicks = fields[19];
+		return startTicks && /^\d+$/.test(startTicks) ? `linux:${startTicks}` : null;
+	} catch {
+		return null;
+	}
+}
+
+function emptyLogRootMetadata(): LogRootMetadata {
+	return {
+		version: 1,
+		ownerPid: process.pid,
+		keepAliveGroups: [],
+		managedGroups: [],
+		pendingKeepAlive: [],
+		pendingManaged: [],
+	};
+}
+
+function isProcessGroupMetadata(value: unknown): value is ProcessGroupMetadata {
+	if (!value || typeof value !== "object") return false;
+	const candidate = value as Record<string, unknown>;
+	return (
+		Number.isInteger(candidate.pgid) &&
+		(candidate.pgid as number) > 0 &&
+		(candidate.identity === null || typeof candidate.identity === "string")
+	);
+}
+
 function readLogRootMetadata(root: string): LogRootMetadata | undefined {
 	try {
-		const value = JSON.parse(fs.readFileSync(path.join(root, LOG_ROOT_METADATA), "utf8")) as Partial<LogRootMetadata>;
-		if (!Number.isInteger(value.ownerPid) || !Array.isArray(value.keepAliveGroups)) return undefined;
-		if (value.pendingKeepAlive !== undefined && !Array.isArray(value.pendingKeepAlive)) return undefined;
-		return {
-			ownerPid: value.ownerPid as number,
-			keepAliveGroups: value.keepAliveGroups.filter((group): group is number => Number.isInteger(group) && group > 0),
-			pendingKeepAlive: (value.pendingKeepAlive ?? []).filter((token): token is string => typeof token === "string"),
-		};
+		const value = JSON.parse(fs.readFileSync(path.join(root, LOG_ROOT_METADATA), "utf8")) as Record<string, unknown>;
+		if (value.version !== 1 || !Number.isInteger(value.ownerPid) || (value.ownerPid as number) <= 0) return undefined;
+		if (!Array.isArray(value.keepAliveGroups) || !value.keepAliveGroups.every(isProcessGroupMetadata)) return undefined;
+		if (!Array.isArray(value.managedGroups) || !value.managedGroups.every(isProcessGroupMetadata)) return undefined;
+		if (!Array.isArray(value.pendingKeepAlive) || !value.pendingKeepAlive.every((token) => typeof token === "string")) {
+			return undefined;
+		}
+		if (!Array.isArray(value.pendingManaged) || !value.pendingManaged.every((token) => typeof token === "string")) {
+			return undefined;
+		}
+		return value as unknown as LogRootMetadata;
 	} catch {
 		return undefined;
 	}
@@ -149,20 +195,24 @@ function writeLogRootMetadata(root: string, metadata: LogRootMetadata): void {
 	}
 }
 
-function setKeepAliveGroup(root: string, pgid: number, keep: boolean): void {
-	const metadata = readLogRootMetadata(root) ?? { ownerPid: process.pid, keepAliveGroups: [], pendingKeepAlive: [] };
-	const groups = new Set(metadata.keepAliveGroups);
-	if (keep) groups.add(pgid);
+function setTrackedGroup(root: string, pgid: number, keepAlive: boolean, keep: boolean): void {
+	const metadata = readLogRootMetadata(root);
+	if (!metadata) throw new Error("Log ownership metadata is missing or invalid.");
+	const field = keepAlive ? "keepAliveGroups" : "managedGroups";
+	const groups = new Map(metadata[field].map((group) => [group.pgid, group]));
+	if (keep) groups.set(pgid, { pgid, identity: processBirthIdentity(pgid) });
 	else groups.delete(pgid);
-	writeLogRootMetadata(root, { ...metadata, keepAliveGroups: [...groups] });
+	writeLogRootMetadata(root, { ...metadata, [field]: [...groups.values()] });
 }
 
-function setKeepAlivePending(root: string, token: string, keep: boolean): void {
-	const metadata = readLogRootMetadata(root) ?? { ownerPid: process.pid, keepAliveGroups: [], pendingKeepAlive: [] };
-	const pending = new Set(metadata.pendingKeepAlive);
+function setPendingRegistration(root: string, token: string, keepAlive: boolean, keep: boolean): void {
+	const metadata = readLogRootMetadata(root);
+	if (!metadata) throw new Error("Log ownership metadata is missing or invalid.");
+	const field = keepAlive ? "pendingKeepAlive" : "pendingManaged";
+	const pending = new Set(metadata[field]);
 	if (keep) pending.add(token);
 	else pending.delete(token);
-	writeLogRootMetadata(root, { ...metadata, pendingKeepAlive: [...pending] });
+	writeLogRootMetadata(root, { ...metadata, [field]: [...pending] });
 }
 
 /**
@@ -170,8 +220,9 @@ function setKeepAlivePending(root: string, token: string, keep: boolean): void {
  *
  * Shutdown cleanup alone is not enough: a killed process never runs it, and whether
  * `session_shutdown` reaches every kind of session is not something this extension should bet on.
- * The directory name identifies its Pi owner, while private metadata records keepAlive groups.
- * Sweeping requires both owner and writers to be gone; no age heuristic can delete a live log.
+ * The directory name identifies its Pi owner, while private metadata records managed groups.
+ * A dead owner's verified non-keepAlive groups are killed; keepAlive or uncertain groups preserve
+ * the root. No age heuristic can delete a live log or authorize killing a reused process-group id.
  */
 function sweepDeadLogRoots(): void {
 	let entries: fs.Dirent[];
@@ -186,9 +237,24 @@ function sweepDeadLogRoots(): void {
 		if (!owner || Number(owner) === process.pid || isProcessAlive(Number(owner))) continue;
 		const root = path.join(os.tmpdir(), entry.name);
 		const metadata = readLogRootMetadata(root);
-		// Missing or invalid metadata is uncertain ownership (including roots from older releases).
-		// Preserve it rather than unlink a log that an untracked keepAlive process may still write.
-		if (!metadata || metadata.pendingKeepAlive.length > 0 || metadata.keepAliveGroups.some(isProcessGroupIdAlive)) continue;
+		// Missing, invalid, old-schema, or interrupted metadata is uncertain ownership.
+		if (!metadata || metadata.pendingKeepAlive.length > 0 || metadata.pendingManaged.length > 0) continue;
+		if (metadata.keepAliveGroups.some((group) => isProcessGroupIdAlive(group.pgid))) continue;
+		let uncertainManagedWriter = false;
+		for (const group of metadata.managedGroups) {
+			if (!isProcessGroupIdAlive(group.pgid)) continue;
+			if (group.identity === null || processBirthIdentity(group.pgid) !== group.identity) {
+				uncertainManagedWriter = true;
+				continue;
+			}
+			try {
+				process.kill(-group.pgid, "SIGKILL");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") uncertainManagedWriter = true;
+			}
+			if (isProcessGroupIdAlive(group.pgid)) uncertainManagedWriter = true;
+		}
+		if (uncertainManagedWriter) continue;
 		try {
 			fs.rmSync(root, { recursive: true, force: true });
 		} catch {
@@ -385,7 +451,7 @@ export default function (pi: ExtensionAPI) {
 		const created = fs.mkdtempSync(LOG_ROOT_PREFIX);
 		try {
 			fs.chmodSync(created, 0o700);
-			writeLogRootMetadata(created, { ownerPid: process.pid, keepAliveGroups: [], pendingKeepAlive: [] });
+			writeLogRootMetadata(created, emptyLogRootMetadata());
 			logRoot = created;
 			return created;
 		} catch (error) {
@@ -456,11 +522,11 @@ export default function (pi: ExtensionAPI) {
 		nudgeTimer.unref?.();
 	}
 
-	function recordKeepAliveGroup(entry: BgProcess, keep: boolean): void {
-		if (!entry.keepAlive || entry.child.pid === undefined) return;
+	function recordTrackedGroup(entry: BgProcess, keep: boolean): void {
+		if (entry.child.pid === undefined) return;
 		const root = path.dirname(entry.logFile);
 		try {
-			setKeepAliveGroup(root, entry.child.pid, keep);
+			setTrackedGroup(root, entry.child.pid, entry.keepAlive, keep);
 		} catch (error) {
 			if (keep) throw error;
 			/* the scratch root may already have been removed during shutdown */
@@ -476,7 +542,7 @@ export default function (pi: ExtensionAPI) {
 		if (entry.escalationTimer) clearTimeout(entry.escalationTimer);
 		entry.groupMonitor = undefined;
 		entry.escalationTimer = undefined;
-		recordKeepAliveGroup(entry, false);
+		recordTrackedGroup(entry, false);
 		if (!entry.spawnError && !entry.stopping && entry.exitCode !== null) {
 			notify(
 				`Background process ${entry.id} (${entry.name}) exited ${entry.signal ?? entry.exitCode} after ${elapsed(entry.startedAt, entry.exitedAt)}.\nLast output:\n${tailFile(entry.logFile, 10)}`,
@@ -645,14 +711,12 @@ export default function (pi: ExtensionAPI) {
 				throw toolError(`Could not create private log for ${id}: ${(error as Error).message}`);
 			}
 			const keepAlive = params.keepAlive === true;
-			if (keepAlive) {
-				try {
-					setKeepAlivePending(root, id, true);
-				} catch (error) {
-					fs.closeSync(out);
-					fs.rmSync(logFile, { force: true });
-					throw toolError(`Could not register pending keepAlive process ${id}: ${(error as Error).message}`);
-				}
+			try {
+				setPendingRegistration(root, id, keepAlive, true);
+			} catch (error) {
+				fs.closeSync(out);
+				fs.rmSync(logFile, { force: true });
+				throw toolError(`Could not register pending process ${id}: ${(error as Error).message}`);
 			}
 			let child: ChildProcess;
 			try {
@@ -669,7 +733,11 @@ export default function (pi: ExtensionAPI) {
 					fs.closeSync(out);
 				} finally {
 					fs.rmSync(logFile, { force: true });
-					if (keepAlive) setKeepAlivePending(root, id, false);
+					try {
+						setPendingRegistration(root, id, keepAlive, false);
+					} catch {
+						/* uncertain metadata intentionally prevents unsafe sweeping */
+					}
 				}
 				throw toolError(`Background process ${id} failed to start: ${(error as Error).message}`);
 			}
@@ -688,8 +756,8 @@ export default function (pi: ExtensionAPI) {
 					cleanup();
 					try {
 						child.unref();
-						recordKeepAliveGroup(entry, true);
-						if (keepAlive) setKeepAlivePending(root, id, false);
+						recordTrackedGroup(entry, true);
+						setPendingRegistration(root, id, keepAlive, false);
 						resolve();
 					} catch (error) {
 						entry.spawnError = (error as Error).message;
@@ -711,7 +779,11 @@ export default function (pi: ExtensionAPI) {
 					closeLog(entry);
 					running.delete(entry.id);
 					fs.rmSync(logFile, { force: true });
-					if (keepAlive) setKeepAlivePending(root, id, false);
+					try {
+						setPendingRegistration(root, id, keepAlive, false);
+					} catch {
+						/* uncertain metadata intentionally prevents unsafe sweeping */
+					}
 					entry.resolveClosed();
 					reject(error);
 				};
@@ -1121,12 +1193,13 @@ export default function (pi: ExtensionAPI) {
 			closing.push(waitForProcessClose(entry));
 		}
 		await Promise.allSettled(closing);
+		const preserveRoot = survivors > 0 || [...running.values()].some(isAlive);
 		running.clear();
 		// Logs of a process that is still running are still being written to; everything else is
 		// scratch that would otherwise sit in /tmp forever.
 		const finishedRoot = logRoot;
 		logRoot = undefined;
-		if (survivors === 0 && finishedRoot !== undefined) {
+		if (!preserveRoot && finishedRoot !== undefined) {
 			try {
 				fs.rmSync(finishedRoot, { recursive: true, force: true });
 			} catch {

@@ -86,17 +86,18 @@ together produce one turn rather than five.
 
 Logs live in a randomly suffixed, owner-only (`0700`) directory named after the pi process that
 owns them; files are `0600`. The directory is removed at session shutdown unless a `keepAlive`
-process still writes there. Each root records pending registrations and live keepAlive process
-groups, so startup sweeping preserves a dead owner's root while one of those groups may still write
-and removes it once ownership is known and both owner and writers are gone. Legacy or malformed
-roots with uncertain ownership are conservatively left untouched. Only the last 64 KB of a log is
-read internally, and every tool result is
+process still writes there. Versioned metadata records pending registrations and every managed
+process group. On Linux, startup sweeping SIGKILLs a dead owner's non-keepAlive groups only when
+the recorded process-birth identity still matches; keepAlive groups remain untouched. Legacy,
+malformed, or otherwise uncertain roots are conservatively left in place. Only the last 64 KB of a
+log is read internally, and every tool result is
 capped at Pi's 50 KB / 2000-line limit with the full private path reported when truncation occurs.
 The most recent twenty exited entries are kept for `bg_logs` before older ones are discarded.
 
 The second half matters: a killed process never runs its shutdown handler, and cleanup that
 depends on a single event is cleanup that silently stops happening. Owner and process-group
-liveness are checked with `kill(pid, 0)`, so live writers' logs are never swept based on age.
+liveness are checked with `kill(pid, 0)`; Linux birth identities prevent a recycled numeric PGID
+from authorizing a kill. Live or uncertain writers' logs are never swept based on age.
 
 ## Checks
 
@@ -106,9 +107,11 @@ shutdown, permissions, output bounds, and failure cleanup.
 
 ## Known limits
 
-Roots created by versions that predate ownership metadata cannot be swept safely and may require
-manual removal once their writers are known to be gone. Commands that deliberately daemonize into
-a different process group cannot be managed after they leave the group pi-bg created.
+Roots created by versions that predate current ownership metadata cannot be swept safely and may
+require manual removal once their writers are known to be gone. After an abrupt owner crash,
+non-Linux systems likewise preserve an orphan and its log when no safe process-birth identity is
+available. Commands that deliberately daemonize into a different process group cannot be managed
+after they leave the group pi-bg created.
 
 `bg_watch` runs its first poll before returning, in every mode, so a slow poll command delays even
 the interactive path by that one poll. The poll is capped by the smaller of the watch interval and

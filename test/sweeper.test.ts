@@ -58,6 +58,39 @@ test("startup sweep preserves a legacy root whose writer ownership is uncertain"
   assert.match(fs.readFileSync(logFile, "utf8"), /legacy-tick/);
 });
 
+test("startup sweep preserves a prior metadata schema with uncertain live writers", { timeout: 5_000 }, async (t) => {
+  const deadOwnerPid = 905_000_000 + (process.pid % 10_000);
+  const root = path.join(os.tmpdir(), `pi-bg-${deadOwnerPid}-old-schema`);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-bg-old-schema-"));
+  const worker = path.join(dir, "worker.mjs");
+  const logFile = path.join(root, "writer.log");
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.mkdirSync(root, { mode: 0o700 });
+  fs.writeFileSync(path.join(root, ".owner.json"), `${JSON.stringify({ ownerPid: deadOwnerPid, keepAliveGroups: [] })}\n`);
+  fs.writeFileSync(worker, 'setInterval(() => console.log("old-schema-tick"), 50);\n');
+  const out = fs.openSync(logFile, "a", 0o600);
+  const child = spawn(process.execPath, [worker], { detached: true, stdio: ["ignore", out, out] });
+  await new Promise<void>((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
+  fs.closeSync(out);
+  child.unref();
+  t.after(async () => {
+    if (child.pid !== undefined && alive(child.pid)) process.kill(-child.pid, "SIGKILL");
+    await delay(100);
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  await delay(100);
+
+  const nextSession = createHarness();
+  await nextSession.shutdown();
+
+  assert.equal(fs.existsSync(logFile), true);
+  assert.equal(child.pid === undefined ? false : alive(child.pid), true);
+});
+
 test("startup sweep preserves a root with an interrupted keepAlive registration", async (t) => {
   const deadOwnerPid = 910_000_000 + (process.pid % 10_000);
   const root = path.join(os.tmpdir(), `pi-bg-${deadOwnerPid}-pending`);
@@ -65,7 +98,14 @@ test("startup sweep preserves a root with an interrupted keepAlive registration"
   fs.mkdirSync(root, { mode: 0o700 });
   fs.writeFileSync(
     path.join(root, ".owner.json"),
-    `${JSON.stringify({ ownerPid: deadOwnerPid, keepAliveGroups: [], pendingKeepAlive: ["pending"] })}\n`,
+    `${JSON.stringify({
+      version: 1,
+      ownerPid: deadOwnerPid,
+      keepAliveGroups: [],
+      managedGroups: [],
+      pendingKeepAlive: ["pending"],
+      pendingManaged: [],
+    })}\n`,
     { mode: 0o600 },
   );
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -74,6 +114,58 @@ test("startup sweep preserves a root with an interrupted keepAlive registration"
   await nextSession.shutdown();
 
   assert.equal(fs.existsSync(root), true);
+});
+
+test("startup sweep kills managed groups left by a dead owner", { timeout: 10_000 }, async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("safe orphan reclamation requires Linux process birth identities");
+    return;
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-bg-managed-sweep-"));
+  const pidFile = path.join(dir, "worker.pid");
+  const worker = path.join(dir, "worker.mjs");
+  fs.writeFileSync(
+    worker,
+    [
+      'import fs from "node:fs";',
+      `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+      'process.on("SIGTERM", () => {});',
+      'setInterval(() => console.log("managed-tick"), 50);',
+      "",
+    ].join("\n"),
+  );
+  let workerPid: number | undefined;
+  let logRoot: string | undefined;
+  t.after(async () => {
+    if (workerPid === undefined && fs.existsSync(pidFile)) workerPid = Number(fs.readFileSync(pidFile, "utf8"));
+    if (workerPid !== undefined && alive(workerPid)) process.kill(workerPid, "SIGKILL");
+    await delay(100);
+    if (logRoot) fs.rmSync(logRoot, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const result = spawnSync(
+    path.join(projectRoot, "node_modules", ".bin", "tsx"),
+    [path.join(projectRoot, "test", "fixtures", "start-managed.ts")],
+    {
+      cwd: projectRoot,
+      env: { ...process.env, PI_BG_TEST_WORKER: worker },
+      encoding: "utf8",
+      timeout: 5_000,
+    },
+  );
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const parsed = JSON.parse(result.stdout.trim()) as { logFile: string };
+  logRoot = path.dirname(parsed.logFile);
+  for (let attempt = 0; attempt < 50 && !fs.existsSync(pidFile); attempt++) await delay(20);
+  workerPid = Number(fs.readFileSync(pidFile, "utf8"));
+  assert.equal(alive(workerPid), true);
+
+  const nextSession = createHarness();
+  await nextSession.shutdown();
+  for (let attempt = 0; attempt < 50 && alive(workerPid); attempt++) await delay(20);
+
+  assert.equal(alive(workerPid), false);
 });
 
 test("startup sweep preserves a dead owner's root while a keepAlive group still writes", { timeout: 10_000 }, async (t) => {

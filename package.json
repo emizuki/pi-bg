@@ -3,11 +3,28 @@
   "version": "0.1.0",
   "description": "Background processes and external-condition waits for pi: run a server, wait for CI, without blocking a turn.",
   "private": true,
-  "keywords": ["pi-package"],
+  "type": "module",
+  "scripts": {
+    "test": "tsx --test --test-concurrency=1 test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
-  "pi": { "extensions": ["./extensions"] },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.5",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3"
   }
 }

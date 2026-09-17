@@ -34,7 +34,9 @@ bg_stop  b00f2c2a             -> Stopping b00f2c2a (npm).
 
 `keepAlive` is off by default, so a process is stopped when the session ends. An orphaned server
 holding a port is harder to find than it is to restart. Pass `keepAlive: true` to detach one
-deliberately.
+deliberately. At that session boundary the process becomes unmanaged: it keeps running and writing
+to its private log, but callbacks from the old session are disabled and later sessions do not list
+or stop it.
 
 Stopping signals the process **group**, not just the shell pi spawned. With `shell: true` a
 command containing any shell operator — `cd app && npm run dev` — runs as a grandchild, and
@@ -63,28 +65,31 @@ bg_watch { command: "gh pr checks --required", label: "CI" }
 ```
 
 The interval defaults to 60s and is floored at 5s: below that, polling something like `gh` costs
-more in rate limit than it saves in latency. The first poll runs immediately, because the
-condition is often already true and waiting a full interval to discover that is the worst
-possible behaviour.
+more in rate limit than it saves in latency. `timeoutMs` is a hard deadline independent of that
+interval; an active poll is killed at the deadline and a success arriving late is rejected. The
+first poll runs immediately, because the condition is often already true and waiting a full
+interval to discover that is the worst possible behaviour.
 
 **It adapts to the session it is in**, because a session without a UI has no later turn:
 
 - **Interactive**: returns straight away and carries on. When the condition is met, fails, or
   times out, the session is told through `sendMessage` with `triggerTurn`, which wakes an idle
   agent so it can act on the result.
-- **Print mode** (`pi -p`): waits inside the tool call and returns the outcome. pi exits with its
-  answer there, so a notification would arrive after the process was gone — this was observed,
-  not assumed. `pi -p "wait for CI, then deploy"` therefore does what it says.
+- **Print and JSON modes** (`pi -p`, `--mode json`): wait inside the tool call and return the
+  outcome. They have no later interactive delivery channel, so a notification would have nowhere
+  reliable to land. `pi -p "wait for CI, then deploy"` therefore does what it says.
 
 Notifications are collected into a single wake-up over a short window, so five things finishing
 together produce one turn rather than five.
 
 ## Cleanup
 
-Logs live in a directory named after the pi process that owns them. It is removed at session
-shutdown, and any directory whose owning process is gone is swept at startup. Only the last 64 KB
-of a log is ever read, so a chatty server does not make `bg_list` expensive, and the most recent
-twenty exited entries are kept for `bg_logs` before older ones are discarded.
+Logs live in a randomly suffixed, owner-only (`0700`) directory named after the pi process that
+owns them; files are `0600`. The directory is removed at session shutdown unless a `keepAlive`
+process still writes there, and any directory whose owning process is gone is swept at startup.
+Only the last 64 KB of a log is read internally, and every tool result is capped at Pi's 50 KB /
+2000-line limit with the full private path reported when truncation occurs. The most recent twenty
+exited entries are kept for `bg_logs` before older ones are discarded.
 
 The second half matters: a killed process never runs its shutdown handler, and cleanup that
 depends on a single event is cleanup that silently stops happening. Liveness is checked with
@@ -92,9 +97,9 @@ depends on a single event is cleanup that silently stops happening. Liveness is 
 
 ## Checks
 
-`./check.sh` type-checks for unresolved identifiers. `bun build` only transpiles and will happily
-emit a call to a function that does not exist, so it is not a substitute; the script refuses to
-pass if `tsc` is missing rather than reporting success it could not verify.
+`./check.sh` runs the complete merge gate: strict TypeScript checking followed by the integration
+test suite. The tests exercise real detached process groups, cancellation/deadline races, session
+shutdown, permissions, output bounds, and failure cleanup.
 
 ## Known limits
 
@@ -103,6 +108,6 @@ than one session inside a single process, they would share the process table, th
 the log directory, and one session's shutdown would stop the other's work. Whether that is
 reachable depends on pi's host behaviour, which has not been verified here.
 
-`bg_watch` runs its first poll before returning, in both modes, so a slow poll command delays even
-the interactive "returns immediately" path by that one poll. The poll is capped at the watch
-interval, so the delay is bounded rather than open-ended.
+`bg_watch` runs its first poll before returning, in every mode, so a slow poll command delays even
+the interactive path by that one poll. The poll is capped by the smaller of the watch interval and
+the remaining deadline, so the delay is bounded rather than open-ended.

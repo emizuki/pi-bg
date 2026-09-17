@@ -8,8 +8,8 @@
  *
  * `bg_start` returns as soon as the child is spawned. `bg_watch` polls inside the extension, so
  * waiting never costs a model turn; in an interactive session it returns immediately and pushes
- * the outcome back with `sendMessage`, and in print mode — which exits with its answer, leaving
- * nowhere for a notification to land — it waits inside the tool call instead.
+ * the outcome back with `sendMessage`, and in print/JSON modes — which have no later interactive
+ * delivery channel — it waits inside the tool call instead.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -17,10 +17,18 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	formatSize,
+	truncateHead,
+	truncateTail,
+	type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-const LOG_ROOT = path.join(os.tmpdir(), `pi-bg-${process.pid}`);
+const LOG_ROOT_PREFIX = path.join(os.tmpdir(), `pi-bg-${process.pid}-`);
+let logRoot: string | undefined;
 const DEFAULT_WATCH_INTERVAL_MS = 60_000;
 const DEFAULT_WATCH_TIMEOUT_MS = 60 * 60_000;
 /** Below this, polling an API like `gh` costs more in rate limit than it saves in latency. */
@@ -44,6 +52,8 @@ interface BgProcess {
 	/** Set by terminate(), so an exit we caused is distinguishable from one we did not. */
 	stopping: boolean;
 	logFd?: number;
+	spawnError?: string;
+	escalationTimer?: ReturnType<typeof setTimeout>;
 	child: ChildProcess;
 }
 
@@ -59,9 +69,15 @@ interface BgWatch {
 	polls: number;
 	lastPollAt: number;
 	finishedAt?: number;
-	state: "watching" | "met" | "timeout" | "cancelled";
+	state: "watching" | "met" | "timeout" | "cancelled" | "failed";
 	lastOutput: string;
+	outcome: string;
+	notifyOnFinish: boolean;
+	controller: AbortController;
+	done: Promise<void>;
+	resolveDone: () => void;
 	timer?: ReturnType<typeof setInterval>;
+	deadlineTimer?: ReturnType<typeof setTimeout>;
 }
 
 const running = new Map<string, BgProcess>();
@@ -85,8 +101,11 @@ function shortId(): string {
 	return randomUUID().slice(0, 8);
 }
 
-function ensureLogRoot(): void {
-	fs.mkdirSync(LOG_ROOT, { recursive: true });
+function ensureLogRoot(): string {
+	if (logRoot !== undefined) return logRoot;
+	logRoot = fs.mkdtempSync(LOG_ROOT_PREFIX);
+	fs.chmodSync(logRoot, 0o700);
+	return logRoot;
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -116,7 +135,7 @@ function sweepDeadLogRoots(): void {
 	}
 	for (const entry of entries) {
 		if (!entry.isDirectory()) continue;
-		const owner = /^pi-bg-(\d+)$/.exec(entry.name)?.[1];
+		const owner = /^pi-bg-(\d+)(?:-.+)?$/.exec(entry.name)?.[1];
 		if (!owner || Number(owner) === process.pid || isProcessAlive(Number(owner))) continue;
 		try {
 			fs.rmSync(path.join(os.tmpdir(), entry.name), { recursive: true, force: true });
@@ -126,8 +145,29 @@ function sweepDeadLogRoots(): void {
 	}
 }
 
+function isProcessGroupAlive(entry: BgProcess): boolean {
+	const pid = entry.child.pid;
+	if (pid === undefined) return false;
+	try {
+		process.kill(-pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException)?.code === "EPERM";
+	}
+}
+
 function isAlive(entry: BgProcess): boolean {
-	return entry.exitedAt === undefined;
+	return entry.exitedAt === undefined || isProcessGroupAlive(entry);
+}
+
+function closeLog(entry: BgProcess): void {
+	if (entry.logFd === undefined) return;
+	try {
+		fs.closeSync(entry.logFd);
+	} catch {
+		/* already closed */
+	}
+	entry.logFd = undefined;
 }
 
 function elapsed(from: number, to = Date.now()): string {
@@ -145,6 +185,55 @@ function elapsed(from: number, to = Date.now()): string {
  * silently hiding a busy process's output rather than reporting a problem.
  */
 const TAIL_BYTES = 64 * 1024;
+
+interface BoundedOutput {
+	text: string;
+	truncated: boolean;
+	fullOutputPath?: string;
+}
+
+function writePrivateSnapshot(prefix: string, content: string): string {
+	const file = path.join(ensureLogRoot(), `${prefix}-${shortId()}.log`);
+	fs.writeFileSync(file, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+	fs.chmodSync(file, 0o600);
+	return file;
+}
+
+function boundToolOutput(content: string, keep: "head" | "tail", fullOutputPath: () => string): BoundedOutput {
+	const truncate = keep === "head" ? truncateHead : truncateTail;
+	const probe = truncate(content, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
+	if (!probe.truncated) return { text: content, truncated: false };
+
+	const fullPath = fullOutputPath();
+	let byteBudget = Math.max(1, DEFAULT_MAX_BYTES - Buffer.byteLength(fullPath) - 512);
+	for (let attempt = 0; attempt < 4; attempt++) {
+		const result = truncate(content, {
+			maxBytes: byteBudget,
+			maxLines: Math.max(1, DEFAULT_MAX_LINES - 4),
+		});
+		const suffix =
+			`\n\n[Output truncated: showing ${result.outputLines} of ${result.totalLines} lines ` +
+			`(${formatSize(result.outputBytes)} of ${formatSize(result.totalBytes)}). Full output saved to: ${fullPath}]`;
+		const text = result.content + suffix;
+		const overflow = Buffer.byteLength(text) - DEFAULT_MAX_BYTES;
+		if (overflow <= 0 && text.split("\n").length <= DEFAULT_MAX_LINES) {
+			return { text, truncated: true, fullOutputPath: fullPath };
+		}
+		byteBudget = Math.max(1, byteBudget - Math.max(64, overflow));
+	}
+
+	// The reserved metadata budget above is deliberately generous; this is a final safety net for
+	// unusually long temporary paths rather than a normal path.
+	const fallback = truncate(content, {
+		maxBytes: Math.max(1, DEFAULT_MAX_BYTES - Buffer.byteLength(fullPath) - 1_024),
+		maxLines: Math.max(1, DEFAULT_MAX_LINES - 4),
+	});
+	return {
+		text: `${fallback.content}\n\n[Output truncated. Full output saved to: ${fullPath}]`,
+		truncated: true,
+		fullOutputPath: fullPath,
+	};
+}
 
 function tailFile(file: string, lines: number): string {
 	let text: string;
@@ -195,19 +284,23 @@ function describeWatch(watch: BgWatch): string {
  * reports the entry as stopped. Every child is spawned `detached`, which puts it in its own group,
  * so a negative pid reaches the workload rather than only its wrapper.
  */
-function signalGroup(entry: BgProcess, sig: NodeJS.Signals): void {
-	const pid = entry.child.pid;
+function signalChildGroup(child: ChildProcess, sig: NodeJS.Signals): void {
+	const pid = child.pid;
 	if (pid === undefined) return;
 	try {
 		process.kill(-pid, sig);
 	} catch {
 		// Group already gone, or never created; fall back to the child itself.
 		try {
-			entry.child.kill(sig);
+			child.kill(sig);
 		} catch {
 			/* already dead */
 		}
 	}
+}
+
+function signalGroup(entry: BgProcess, sig: NodeJS.Signals): void {
+	signalChildGroup(entry.child, sig);
 }
 
 /**
@@ -215,23 +308,30 @@ function signalGroup(entry: BgProcess, sig: NodeJS.Signals): void {
  * a timer, and a synchronous shutdown handler in an exiting process never reaches it.
  */
 function terminate(entry: BgProcess, immediate = false): void {
-	if (!isAlive(entry) || entry.stopping) return;
-	entry.stopping = true;
-	signalGroup(entry, "SIGTERM");
 	if (immediate) {
+		if (!isAlive(entry)) return;
+		entry.stopping = true;
+		if (entry.escalationTimer) clearTimeout(entry.escalationTimer);
+		entry.escalationTimer = undefined;
+		// Shutdown must override an earlier graceful stop. The shell leader may already be gone
+		// while descendants remain in its process group.
 		signalGroup(entry, "SIGKILL");
 		return;
 	}
-	const escalate = setTimeout(() => {
-		if (entry.child.exitCode === null && entry.child.signalCode === null) signalGroup(entry, "SIGKILL");
+	if (!isAlive(entry) || entry.stopping) return;
+	entry.stopping = true;
+	signalGroup(entry, "SIGTERM");
+	entry.escalationTimer = setTimeout(() => {
+		entry.escalationTimer = undefined;
+		if (isAlive(entry)) signalGroup(entry, "SIGKILL");
+		pruneExited();
 	}, SIGKILL_GRACE_MS);
-	escalate.unref?.();
-	entry.child.once("exit", () => clearTimeout(escalate));
+	entry.escalationTimer.unref?.();
 }
 
 export default function (pi: ExtensionAPI) {
 	sweepDeadLogRoots();
-	const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
+	let active = true;
 
 	/**
 	 * Coalesce notifications per key: several watches finishing together should wake the session
@@ -241,46 +341,71 @@ export default function (pi: ExtensionAPI) {
 	let pendingLines: string[] = [];
 	let nudgeTimer: ReturnType<typeof setTimeout> | undefined;
 
-	/**
-	 * Collect notifications into one wake-up.
-	 *
-	 * Keying the hold by run id coalesced nothing, because each id fires exactly once: five watches
-	 * finishing together meant five timers and five turns. One shared buffer is what actually
-	 * merges them. The timer is unref'd so a pending nudge cannot hold an exiting process open.
-	 */
-	function notify(content: string) {
+	/** Collect notifications into one wake-up while this extension instance still owns the session. */
+	function notify(content: string): void {
+		if (!active) return;
 		pendingLines.push(content);
 		if (nudgeTimer) clearTimeout(nudgeTimer);
 		nudgeTimer = setTimeout(() => {
 			nudgeTimer = undefined;
 			const body = pendingLines.join("\n\n");
 			pendingLines = [];
-			pi.sendMessage({ customType: "pi-bg", content: body, display: true }, { deliverAs: "followUp", triggerTurn: true });
+			if (!active || body === "") return;
+			try {
+				pi.sendMessage({ customType: "pi-bg", content: body, display: true }, { deliverAs: "followUp", triggerTurn: true });
+			} catch {
+				/* the session may have been replaced between the active check and delivery */
+			}
 		}, NUDGE_HOLD_MS);
 		nudgeTimer.unref?.();
 	}
 
-	/**
-	 * Run a poll command once, bounded.
-	 *
-	 * Without a cap a hung poll means the deadline is never even evaluated — the loop only checks it
-	 * after a poll returns — so `timeoutMs` silently did nothing and a print-mode call could block
-	 * forever on a stuck `curl`.
-	 */
-	function runOnce(command: string, cwd: string, timeoutMs: number): Promise<{ code: number | null; output: string }> {
-		return new Promise((resolve) => {
-			const child = spawn(command, { cwd, shell: true, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-			const cap = setTimeout(() => {
-				if (child.pid !== undefined) {
-					try {
-						process.kill(-child.pid, "SIGKILL");
-					} catch {
-						child.kill("SIGKILL");
-					}
-				}
-			}, Math.max(1_000, timeoutMs));
+	function settleWatch(
+		watch: BgWatch,
+		state: Exclude<BgWatch["state"], "watching">,
+		message: string,
+		announce = watch.notifyOnFinish,
+	): boolean {
+		if (watch.state !== "watching") return false;
+		watch.state = state;
+		watch.finishedAt = Date.now();
+		watch.outcome = message;
+		if (watch.timer) clearInterval(watch.timer);
+		if (watch.deadlineTimer) clearTimeout(watch.deadlineTimer);
+		watches.delete(watch.id);
+		watch.controller.abort();
+		watch.resolveDone();
+		if (announce) notify(message);
+		return true;
+	}
+
+	/** Run one poll command with both a per-poll cap and owner-driven cancellation. */
+	function runOnce(
+		command: string,
+		cwd: string,
+		timeoutMs: number,
+		signal: AbortSignal,
+	): Promise<{ code: number | null; output: string }> {
+		return new Promise((resolve, reject) => {
+			if (signal.aborted) {
+				reject(new Error("Poll aborted."));
+				return;
+			}
+			let child: ChildProcess;
+			try {
+				child = spawn(command, { cwd, shell: true, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+			} catch (error) {
+				reject(error);
+				return;
+			}
+			const abort = () => signalChildGroup(child, "SIGKILL");
+			signal.addEventListener("abort", abort, { once: true });
+			const cap = setTimeout(abort, Math.max(1, timeoutMs));
 			cap.unref?.();
-			child.once("close", () => clearTimeout(cap));
+			const cleanup = () => {
+				clearTimeout(cap);
+				signal.removeEventListener("abort", abort);
+			};
 			let output = "";
 			const collect = (chunk: Buffer) => {
 				output += chunk.toString();
@@ -288,8 +413,14 @@ export default function (pi: ExtensionAPI) {
 			};
 			child.stdout?.on("data", collect);
 			child.stderr?.on("data", collect);
-			child.on("error", (error) => resolve({ code: null, output: `${output}\n${error.message}` }));
-			child.on("close", (code) => resolve({ code, output }));
+			child.once("error", (error) => {
+				cleanup();
+				reject(error);
+			});
+			child.once("close", (code) => {
+				cleanup();
+				resolve({ code, output });
+			});
 		});
 	}
 
@@ -310,35 +441,40 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			ensureLogRoot();
+			// `cmd &` makes sh exit 0 at once, so the entry is marked exited while the real work is
+			// untracked and unstoppable. Validate before opening a log so rejection cannot leak an fd.
+			if (/&\s*$/.test(params.command.trim())) {
+				throw new Error(
+					"Drop the trailing '&': bg_start already runs the command in the background, and a self-backgrounding command exits immediately, leaving the real process untracked.",
+				);
+			}
+			const root = ensureLogRoot();
 			const id = shortId();
 			// Resolved against the session's cwd, which is what the parameter description promises;
 			// spawn would otherwise resolve a relative path against pi's own process cwd.
 			const cwd = params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd;
-			const logFile = path.join(LOG_ROOT, `${id}.log`);
-			const out = fs.openSync(logFile, "a");
+			const logFile = path.join(root, `${id}.log`);
+			const out = fs.openSync(logFile, "ax", 0o600);
+			fs.fchmodSync(out, 0o600);
 			const keepAlive = params.keepAlive === true;
-			// `cmd &` makes sh exit 0 at once, so the entry is marked exited while the real work is
-			// untracked and unstoppable. Backgrounding is this tool's job; say so rather than lie.
-			if (/&\s*$/.test(params.command.trim())) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "Drop the trailing '&': bg_start already runs the command in the background, and a self-backgrounding command exits immediately, leaving the real process untracked.",
-						},
-					],
-					isError: true,
-				};
+			let child: ChildProcess;
+			try {
+				child = spawn(params.command, {
+					cwd,
+					shell: true,
+					// Always its own process group, so terminate() can reach a grandchild. unref always
+					// too: a background process must never be the reason pi cannot exit.
+					detached: true,
+					stdio: ["ignore", out, out],
+				});
+			} catch (error) {
+				try {
+					fs.closeSync(out);
+				} finally {
+					fs.rmSync(logFile, { force: true });
+				}
+				throw error;
 			}
-			const child = spawn(params.command, {
-				cwd,
-				shell: true,
-				// Always its own process group, so terminate() can reach a grandchild. unref always
-				// too: a background process must never be the reason pi cannot exit.
-				detached: true,
-				stdio: ["ignore", out, out],
-			});
 			child.unref();
 
 			const entry: BgProcess = {
@@ -356,21 +492,16 @@ export default function (pi: ExtensionAPI) {
 			running.set(id, entry);
 			pruneExited();
 
-			const closeLog = () => {
-				if (entry.logFd === undefined) return;
-				try {
-					fs.closeSync(entry.logFd);
-				} catch {
-					/* already closed */
-				}
-				entry.logFd = undefined;
-			};
-
 			child.on("error", (error) => {
 				entry.exitedAt ??= Date.now();
 				entry.exitCode = null;
-				closeLog();
-				fs.appendFileSync(logFile, `\n[pi-bg] failed to start: ${error.message}\n`);
+				entry.spawnError = error.message;
+				closeLog(entry);
+				try {
+					fs.appendFileSync(logFile, `\n[pi-bg] failed to start: ${error.message}\n`);
+				} catch {
+					/* shutdown may already have removed the scratch log */
+				}
 				notify(`Background process ${id} (${entry.name}) failed to start: ${error.message}`);
 			});
 			// `close` rather than `exit`: a spawn that fails emits error and close but never exit, so
@@ -379,18 +510,19 @@ export default function (pi: ExtensionAPI) {
 				entry.exitedAt ??= Date.now();
 				if (entry.exitCode === undefined) entry.exitCode = code;
 				entry.signal = signal;
-				closeLog();
+				closeLog(entry);
 				// Keyed on whether we asked for it, not on which signal arrived: an OOM kill or a
 				// `kill` from another terminal is exactly the unexpected death worth reporting.
-				if (!entry.stopping && code !== null) {
+				if (!entry.spawnError && !entry.stopping && code !== null) {
 					notify(
 						`Background process ${id} (${entry.name}) exited ${signal ?? code} after ${elapsed(entry.startedAt, entry.exitedAt)}.\nLast output:\n${tailFile(logFile, 10)}`,
 					);
-				} else if (!entry.stopping && signal) {
+				} else if (!entry.spawnError && !entry.stopping && signal) {
 					notify(
 						`Background process ${id} (${entry.name}) was killed by ${signal} after ${elapsed(entry.startedAt, entry.exitedAt)}.\nLast output:\n${tailFile(logFile, 10)}`,
 					);
 				}
+				pruneExited();
 			});
 
 			return {
@@ -400,6 +532,7 @@ export default function (pi: ExtensionAPI) {
 						text: `Started ${id} (${entry.name})${keepAlive ? ", detached from this session" : ""}. Logs: bg_logs { id: "${id}" }.`,
 					},
 				],
+				details: { id, name: entry.name, cwd, logFile, keepAlive },
 			};
 		},
 	});
@@ -407,26 +540,34 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bg_list",
 		label: "List background work",
-		description: "List background processes and watches started in this session.",
+		description: "List background processes and active watches started in this session. Output is capped at 50KB/2000 lines.",
 		parameters: Type.Object({}),
 		async execute() {
 			const lines = [...running.values()].map(describeProcess);
 			const watchLines = [...watches.values()].map(describeWatch);
 			if (lines.length === 0 && watchLines.length === 0) {
-				return { content: [{ type: "text", text: "Nothing running." }] };
+				return {
+					content: [{ type: "text", text: "Nothing running." }],
+					details: { truncated: false, fullOutputPath: undefined as string | undefined },
+				};
 			}
 			const sections = [
 				lines.length > 0 ? `Processes:\n${lines.join("\n")}` : undefined,
 				watchLines.length > 0 ? `Watches:\n${watchLines.join("\n")}` : undefined,
 			].filter(Boolean);
-			return { content: [{ type: "text", text: sections.join("\n\n") }] };
+			const raw = sections.join("\n\n");
+			const output = boundToolOutput(raw, "head", () => writePrivateSnapshot("list", raw));
+			return {
+				content: [{ type: "text", text: output.text }],
+				details: { truncated: output.truncated, fullOutputPath: output.fullOutputPath },
+			};
 		},
 	});
 
 	pi.registerTool({
 		name: "bg_logs",
 		label: "Read background output",
-		description: "Read the tail of a background process's output.",
+		description: "Read the tail of a background process's output, capped at 50KB/2000 lines.",
 		parameters: Type.Object({
 			id: Type.String({ description: "Process id from bg_start" }),
 			tail: Type.Optional(Type.Number({ description: `Lines to show; default ${LOG_TAIL_DEFAULT}` })),
@@ -435,10 +576,22 @@ export default function (pi: ExtensionAPI) {
 			const entry = running.get(params.id);
 			if (!entry) {
 				const known = [...running.keys()].join(", ") || "none";
-				return { content: [{ type: "text", text: `No process "${params.id}". Known: ${known}.` }], isError: true };
+				throw new Error(`No process "${params.id}". Known: ${known}.`);
 			}
-			const tail = tailFile(entry.logFile, Math.max(1, params.tail ?? LOG_TAIL_DEFAULT));
-			return { content: [{ type: "text", text: `${describeProcess(entry)}\n\n${tail}` }] };
+			const requestedTail = Math.max(1, params.tail ?? LOG_TAIL_DEFAULT);
+			const tail = tailFile(entry.logFile, requestedTail);
+			const raw = `${describeProcess(entry)}\n\n${tail}`;
+			const output = boundToolOutput(raw, "tail", () => entry.logFile);
+			return {
+				content: [{ type: "text", text: output.text }],
+				details: {
+					id: entry.id,
+					logFile: entry.logFile,
+					tail: requestedTail,
+					truncated: output.truncated,
+					fullOutputPath: output.fullOutputPath,
+				},
+			};
 		},
 	});
 
@@ -450,23 +603,27 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params) {
 			const watch = watches.get(params.id);
 			if (watch) {
-				if (watch.timer) clearInterval(watch.timer);
-				if (watch.state !== "watching") {
-					return { content: [{ type: "text", text: `Watch ${watch.id} already ${watch.state}.` }] };
-				}
-				watch.state = "cancelled";
-				watch.finishedAt = Date.now();
-				return { content: [{ type: "text", text: `Cancelled watch ${watch.id}.` }] };
+				settleWatch(watch, "cancelled", `Watch ${watch.id} cancelled.`, false);
+				return {
+					content: [{ type: "text", text: `Cancelled watch ${watch.id}.` }],
+					details: { id: watch.id, kind: "watch", state: watch.state },
+				};
 			}
 			const entry = running.get(params.id);
 			if (!entry) {
-				return { content: [{ type: "text", text: `No process or watch "${params.id}".` }], isError: true };
+				throw new Error(`No process or watch "${params.id}".`);
 			}
 			if (!isAlive(entry)) {
-				return { content: [{ type: "text", text: `${entry.id} already exited.` }] };
+				return {
+					content: [{ type: "text", text: `${entry.id} already exited.` }],
+					details: { id: entry.id, kind: "process", state: "exited" },
+				};
 			}
 			terminate(entry);
-			return { content: [{ type: "text", text: `Stopping ${entry.id} (${entry.name}).` }] };
+			return {
+				content: [{ type: "text", text: `Stopping ${entry.id} (${entry.name}).` }],
+				details: { id: entry.id, kind: "process", state: "stopping" },
+			};
 		},
 	});
 
@@ -474,9 +631,9 @@ export default function (pi: ExtensionAPI) {
 		name: "bg_watch",
 		label: "Watch for a condition",
 		description: [
-			"Poll a command until it succeeds, without blocking this turn and without spending a model turn per poll.",
+			"Poll a command until it succeeds without spending a model turn per poll.",
 			"Use it to wait on something outside the session: CI going green, a deploy settling, a port opening.",
-			"Returns immediately; when the condition is met, fails, or times out, the session is told.",
+			"In interactive TUI/RPC mode it returns after the first poll and reports later completion; in print/JSON mode it waits and returns the outcome.",
 		].join(" "),
 		parameters: Type.Object({
 			command: Type.String({ description: 'Shell command to poll, e.g. "gh pr checks --required"' }),
@@ -498,15 +655,17 @@ export default function (pi: ExtensionAPI) {
 				try {
 					pattern = new RegExp(params.until);
 				} catch (error) {
-					return {
-						content: [{ type: "text", text: `Invalid "until" regex: ${(error as Error).message}` }],
-						isError: true,
-					};
+					throw new Error(`Invalid "until" regex: ${(error as Error).message}`);
 				}
 			}
 
 			const id = shortId();
 			const intervalMs = Math.max(MIN_WATCH_INTERVAL_MS, params.intervalMs ?? DEFAULT_WATCH_INTERVAL_MS);
+			const startedAt = Date.now();
+			let resolveDone!: () => void;
+			const done = new Promise<void>((resolve) => {
+				resolveDone = resolve;
+			});
 			const watch: BgWatch = {
 				id,
 				label: params.label ?? "condition",
@@ -514,44 +673,70 @@ export default function (pi: ExtensionAPI) {
 				cwd: params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd,
 				until: params.until,
 				intervalMs,
-				deadline: Date.now() + (params.timeoutMs ?? DEFAULT_WATCH_TIMEOUT_MS),
-				startedAt: Date.now(),
+				deadline: startedAt + Math.max(0, params.timeoutMs ?? DEFAULT_WATCH_TIMEOUT_MS),
+				startedAt,
 				polls: 0,
 				lastPollAt: 0,
 				state: "watching",
 				lastOutput: "",
+				outcome: "",
+				notifyOnFinish: false,
+				controller: new AbortController(),
+				done,
+				resolveDone,
 			};
 			watches.set(id, watch);
 
+			const timeoutMessage = () =>
+				`Watch ${id} timed out after ${elapsed(watch.startedAt)} waiting for ${watch.label}.\nLast output:\n${watch.lastOutput.slice(-1_500)}`;
+			const onDeadline = () => settleWatch(watch, "timeout", timeoutMessage());
+			watch.deadlineTimer = setTimeout(onDeadline, Math.max(0, watch.deadline - Date.now()));
+			if (ctx.hasUI) watch.deadlineTimer.unref?.();
+
+			const onAbort = () => settleWatch(watch, "cancelled", `Watch ${id} aborted.`, false);
+			if (signal?.aborted) onAbort();
+			else signal?.addEventListener("abort", onAbort, { once: true });
+
 			let polling = false;
-			const finish = (state: BgWatch["state"], message: string) => {
-				// A poll already in flight when the watch was cancelled must not resurrect it into
-				// "met" and announce a result nobody is waiting for.
-				if (watch.state !== "watching") return;
-				watch.state = state;
-				watch.finishedAt = Date.now();
-				if (watch.timer) clearInterval(watch.timer);
-				if (ctx.hasUI) notify(message);
-			};
 			const poll = async () => {
 				// A slow command must not stack up behind itself; skip rather than queue.
 				if (polling || watch.state !== "watching") return;
+				if (Date.now() >= watch.deadline) {
+					onDeadline();
+					return;
+				}
 				polling = true;
 				try {
 					watch.lastPollAt = Date.now();
-					const { code, output } = await runOnce(watch.command, watch.cwd, watch.intervalMs);
+					const remainingMs = Math.max(1, watch.deadline - Date.now());
+					const { code, output } = await runOnce(
+						watch.command,
+						watch.cwd,
+						Math.min(watch.intervalMs, remainingMs),
+						watch.controller.signal,
+					);
+					if (watch.state !== "watching") return;
 					watch.polls++;
 					watch.lastOutput = output.slice(-4_000);
+					// The deadline wins ties: a command completing late must not be accepted as success.
+					if (Date.now() >= watch.deadline) {
+						onDeadline();
+						return;
+					}
 					const met = pattern ? pattern.test(output) : code === 0;
 					if (met) {
-						finish(
+						settleWatch(
+							watch,
 							"met",
 							`Watch ${id} met after ${elapsed(watch.startedAt)}: ${watch.label}.\n$ ${watch.command}\n${output.slice(-1_500)}`,
 						);
-					} else if (Date.now() >= watch.deadline) {
-						finish(
-							"timeout",
-							`Watch ${id} timed out after ${elapsed(watch.startedAt)} waiting for ${watch.label}.\nLast output:\n${output.slice(-1_500)}`,
+					}
+				} catch (error) {
+					if (watch.state === "watching") {
+						settleWatch(
+							watch,
+							"failed",
+							`Watch ${id} failed while waiting for ${watch.label}: ${(error as Error).message}`,
 						);
 					}
 				} finally {
@@ -559,94 +744,88 @@ export default function (pi: ExtensionAPI) {
 				}
 			};
 
-			// Check once immediately: the condition may already hold, and waiting a full interval to
-			// discover that is the most annoying possible behaviour.
-			await poll();
+			try {
+				// Check once immediately: the condition may already hold, and waiting a full interval to
+				// discover that is the most annoying possible behaviour.
+				await poll();
 
-			// The first poll can settle it, and the comment above says that is the common case.
-			// Falling through would arm an interval on a finished watch and answer "watching" for
-			// something already met, with a contradicting notification arriving moments later.
-			if (watch.state !== "watching") {
-				watches.delete(id);
-				const settled = watch.state === "met";
-				return {
-					content: [
-						{
-							type: "text",
-							text: settled
-								? `Already true: ${watch.label}.\n${watch.lastOutput.slice(-1_500)}`
-								: `Watch ${watch.state} immediately for ${watch.label}.\n${watch.lastOutput.slice(-1_500)}`,
-						},
-					],
-					isError: !settled,
-				};
-			}
-
-			// A session with no UI has no later. `-p` exits with its answer, so a notification
-			// arrives after the process is gone — observed, not assumed. There the only place the
-			// result can be delivered is this tool call, so wait in it.
-			if (!ctx.hasUI) {
-				while (watch.state === "watching") {
-					if (signal?.aborted) {
-						watch.state = "cancelled";
-						watch.finishedAt = Date.now();
-						watches.delete(id);
-						return { content: [{ type: "text", text: `Watch ${id} aborted.` }], isError: true };
-					}
-					await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, 1_000)));
-					if (Date.now() - watch.lastPollAt >= intervalMs) await poll();
+				if (watch.state !== "watching") {
+					if (watch.state !== "met") throw new Error(watch.outcome);
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Already true: ${watch.label}.\n${watch.lastOutput.slice(-1_500)}`,
+							},
+						],
+						details: { id, state: watch.state, polls: watch.polls },
+					};
 				}
-				watches.delete(id);
-				const met = watch.state === "met";
+
+				watch.timer = setInterval(() => void poll(), intervalMs);
+				if (ctx.hasUI) {
+					watch.notifyOnFinish = true;
+					watch.timer.unref?.();
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Watching ${id}: ${watch.label}, every ${Math.round(intervalMs / 1000)}s. You will be told when it is met. Carry on with other work.`,
+							},
+						],
+						details: { id, state: watch.state, polls: watch.polls },
+					};
+				}
+
+				// Print and JSON modes have no later delivery channel, so the tool owns the wait.
+				await watch.done;
+				const finalState = watch.state as BgWatch["state"];
+				if (finalState !== "met") throw new Error(watch.outcome);
 				return {
 					content: [
 						{
 							type: "text",
-							text: met
-								? `Watch met after ${elapsed(watch.startedAt)}: ${watch.label}.\n${watch.lastOutput.slice(-1_500)}`
-								: `Watch timed out after ${elapsed(watch.startedAt)} waiting for ${watch.label}.\nLast output:\n${watch.lastOutput.slice(-1_500)}`,
+							text: `Watch met after ${elapsed(watch.startedAt)}: ${watch.label}.\n${watch.lastOutput.slice(-1_500)}`,
 						},
 					],
-					isError: !met,
+					details: { id, state: finalState, polls: watch.polls },
 				};
+			} finally {
+				signal?.removeEventListener("abort", onAbort);
 			}
-
-			watch.timer = setInterval(() => void poll(), intervalMs);
-			watch.timer.unref?.();
-
-			return {
-				content: [
-					{
-						type: "text",
-						text: `Watching ${id}: ${watch.label}, every ${Math.round(intervalMs / 1000)}s. You will be told when it is met. Carry on with other work.`,
-					},
-				],
-			};
 		},
 	});
 
 	pi.on("session_shutdown", () => {
-		for (const watch of watches.values()) if (watch.timer) clearInterval(watch.timer);
-		watches.clear();
+		if (!active) return;
+		active = false;
+		for (const watch of [...watches.values()]) {
+			settleWatch(watch, "cancelled", `Watch ${watch.id} cancelled by session shutdown.`, false);
+		}
 		if (nudgeTimer) clearTimeout(nudgeTimer);
+		nudgeTimer = undefined;
 		pendingLines = [];
 		let survivors = 0;
 		for (const entry of running.values()) {
 			// keepAlive is the whole point of keepAlive: leave those running.
 			if (entry.keepAlive && isAlive(entry)) {
 				survivors++;
+				closeLog(entry);
 				continue;
 			}
 			// Immediate: the graceful escalation runs on a timer, and an exiting process never
 			// reaches it, so a child that ignores SIGTERM would outlive the session it belongs to.
 			terminate(entry, true);
+			closeLog(entry);
 		}
 		running.clear();
 		// Logs of a process that is still running are still being written to; everything else is
 		// scratch that would otherwise sit in /tmp forever.
-		if (survivors === 0) {
+		const finishedRoot = logRoot;
+		logRoot = undefined;
+		if (survivors === 0 && finishedRoot !== undefined) {
 			try {
-				fs.rmSync(LOG_ROOT, { recursive: true, force: true });
+				fs.rmSync(finishedRoot, { recursive: true, force: true });
 			} catch {
 				/* ignore */
 			}

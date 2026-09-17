@@ -630,22 +630,35 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	}
 
-	/** Run one poll command with both a per-poll cap and owner-driven cancellation. */
+	/** Run one durably owned poll command with both a per-poll cap and cancellation. */
 	function runOnce(
 		command: string,
 		cwd: string,
 		timeoutMs: number,
 		signal: AbortSignal,
+		ownershipRoot: string,
+		registrationToken: string,
 	): Promise<{ code: number | null; output: string; timedOut: boolean }> {
 		return new Promise((resolve, reject) => {
 			if (signal.aborted) {
 				reject(new Error("Poll aborted."));
 				return;
 			}
+			try {
+				setPendingRegistration(ownershipRoot, registrationToken, false, true);
+			} catch (error) {
+				reject(error);
+				return;
+			}
 			let child: ChildProcess;
 			try {
 				child = spawn(command, { cwd, shell: true, detached: true, stdio: ["ignore", "pipe", "pipe"] });
 			} catch (error) {
+				try {
+					setPendingRegistration(ownershipRoot, registrationToken, false, false);
+				} catch {
+					/* uncertain metadata intentionally prevents unsafe sweeping */
+				}
 				reject(error);
 				return;
 			}
@@ -654,6 +667,8 @@ export default function (pi: ExtensionAPI) {
 			let leaderCode: number | null = null;
 			let timedOut = false;
 			let settled = false;
+			let registeredPgid: number | undefined;
+			let failure: Error | undefined;
 			let groupMonitor: ReturnType<typeof setInterval> | undefined;
 			const killGroup = () => signalChildGroup(child, "SIGKILL");
 			const onAbort = () => killGroup();
@@ -667,13 +682,36 @@ export default function (pi: ExtensionAPI) {
 				if (groupMonitor) clearInterval(groupMonitor);
 				signal.removeEventListener("abort", onAbort);
 			};
+			const forgetOwnership = () => {
+				try {
+					if (registeredPgid !== undefined) setTrackedGroup(ownershipRoot, registeredPgid, false, false);
+					setPendingRegistration(ownershipRoot, registrationToken, false, false);
+				} catch {
+					/* stale dead-group metadata is safe and will be swept with its owner */
+				}
+			};
 			const finishIfGroupDead = () => {
 				if (settled || !leaderClosed) return;
 				const pid = child.pid;
 				if (pid !== undefined && isProcessGroupIdAlive(pid)) return;
 				settled = true;
 				cleanup();
-				resolve({ code: timedOut ? null : leaderCode, output, timedOut });
+				forgetOwnership();
+				if (failure) reject(failure);
+				else resolve({ code: timedOut ? null : leaderCode, output, timedOut });
+			};
+			const registerGroup = () => {
+				if (registeredPgid !== undefined || failure) return;
+				const pid = child.pid;
+				if (pid === undefined) return;
+				try {
+					setTrackedGroup(ownershipRoot, pid, false, true);
+					registeredPgid = pid;
+					setPendingRegistration(ownershipRoot, registrationToken, false, false);
+				} catch (error) {
+					failure = error as Error;
+					killGroup();
+				}
 			};
 			const collect = (chunk: Buffer) => {
 				output += chunk.toString();
@@ -681,20 +719,23 @@ export default function (pi: ExtensionAPI) {
 			};
 			child.stdout?.on("data", collect);
 			child.stderr?.on("data", collect);
+			child.once("spawn", registerGroup);
 			child.once("error", (error) => {
 				if (settled) return;
-				settled = true;
-				cleanup();
-				reject(error);
+				failure = error;
+				leaderClosed = true;
+				killGroup();
+				finishIfGroupDead();
+				if (!settled && !groupMonitor) groupMonitor = setInterval(finishIfGroupDead, PROCESS_GROUP_PROBE_MS);
 			});
 			child.once("close", (code) => {
 				leaderClosed = true;
 				leaderCode = code;
 				finishIfGroupDead();
-				if (!settled) {
-					groupMonitor = setInterval(finishIfGroupDead, PROCESS_GROUP_PROBE_MS);
-				}
+				if (!settled) groupMonitor = setInterval(finishIfGroupDead, PROCESS_GROUP_PROBE_MS);
 			});
+			// On successful Unix spawns pid is available synchronously, minimizing the crash window.
+			registerGroup();
 		});
 	}
 
@@ -1038,6 +1079,7 @@ export default function (pi: ExtensionAPI) {
 			if (!Number.isFinite(requestedTimeoutMs) || requestedTimeoutMs > MAX_TIMER_MS) {
 				throw toolError(`timeoutMs exceeds Node's timer maximum of ${MAX_TIMER_MS}.`);
 			}
+			const ownershipRoot = ensureLogRoot();
 			const id = shortId();
 			const intervalMs = Math.max(MIN_WATCH_INTERVAL_MS, requestedIntervalMs);
 			const startedAt = Date.now();
@@ -1093,6 +1135,8 @@ export default function (pi: ExtensionAPI) {
 						watch.cwd,
 						Math.min(watch.intervalMs, remainingMs),
 						watch.controller.signal,
+						ownershipRoot,
+						`watch-${watch.id}-${watch.polls}-${shortId()}`,
 					);
 					watch.activePoll = activePoll.then(
 						() => undefined,

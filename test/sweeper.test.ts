@@ -170,6 +170,66 @@ test("startup sweep kills managed groups left by a dead owner", { timeout: 10_00
   assert.equal(alive(workerPid), false);
 });
 
+test("startup sweep reclaims an active poll group after its owner crashes", { timeout: 10_000 }, async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("safe orphan reclamation requires Linux process birth identities");
+    return;
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-bg-poll-crash-"));
+  const pidFile = path.join(dir, "poll.pid");
+  const ownerPidFile = path.join(dir, "owner.pid");
+  const owner = spawn(
+    path.join(projectRoot, "node_modules", ".bin", "tsx"),
+    [path.join(projectRoot, "test", "fixtures", "start-poll-and-wait.ts")],
+    {
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        PI_BG_TEST_PID_FILE: pidFile,
+        PI_BG_TEST_OWNER_PID_FILE: ownerPidFile,
+      },
+      stdio: "ignore",
+    },
+  );
+  await new Promise<void>((resolve, reject) => {
+    owner.once("spawn", resolve);
+    owner.once("error", reject);
+  });
+  const ownerExit = new Promise<void>((resolve) => owner.once("exit", () => resolve()));
+  let extensionOwnerPid: number | undefined;
+  let pollPid: number | undefined;
+  t.after(async () => {
+    if (extensionOwnerPid === undefined && fs.existsSync(ownerPidFile)) {
+      extensionOwnerPid = Number(fs.readFileSync(ownerPidFile, "utf8"));
+    }
+    if (extensionOwnerPid !== undefined && alive(extensionOwnerPid)) process.kill(extensionOwnerPid, "SIGKILL");
+    if (owner.pid !== undefined && alive(owner.pid)) process.kill(owner.pid, "SIGKILL");
+    if (pollPid === undefined && fs.existsSync(pidFile)) pollPid = Number(fs.readFileSync(pidFile, "utf8"));
+    if (pollPid !== undefined && alive(pollPid)) process.kill(-pollPid, "SIGKILL");
+    await delay(100);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  for (
+    let attempt = 0;
+    attempt < 100 && (!fs.existsSync(pidFile) || !fs.existsSync(ownerPidFile));
+    attempt++
+  ) {
+    await delay(20);
+  }
+  extensionOwnerPid = Number(fs.readFileSync(ownerPidFile, "utf8"));
+  pollPid = Number(fs.readFileSync(pidFile, "utf8"));
+  assert.equal(alive(pollPid), true);
+
+  process.kill(extensionOwnerPid, "SIGKILL");
+  await ownerExit;
+  assert.equal(alive(extensionOwnerPid), false);
+  const nextSession = createHarness();
+  await nextSession.shutdown();
+  for (let attempt = 0; attempt < 50 && alive(pollPid); attempt++) await delay(20);
+
+  assert.equal(alive(pollPid), false);
+});
+
 test("startup sweep never trusts process metadata from a non-private root", { timeout: 10_000 }, async (t) => {
   if (process.platform !== "linux") {
     t.skip("safe orphan reclamation requires Linux process birth identities");

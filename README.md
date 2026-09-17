@@ -88,8 +88,9 @@ Logs live in a randomly suffixed, owner-only (`0700`) directory named after the 
 owns them; files are `0600`. The directory is removed at session shutdown unless a `keepAlive`
 process still writes there. Versioned metadata records pending registrations and every managed
 process group. On Linux, startup sweeping SIGKILLs a dead owner's non-keepAlive groups only when
-the recorded process-birth identity still matches; keepAlive groups remain untouched. Legacy,
-malformed, or otherwise uncertain roots are conservatively left in place. Only the last 64 KB of a
+the private root, metadata ownership, and recorded process-birth identity all still match;
+keepAlive groups remain untouched. Legacy, malformed, non-private, or otherwise uncertain roots
+are conservatively left in place. Only the last 64 KB of a
 log is read internally, and every tool result is
 capped at Pi's 50 KB / 2000-line limit with the full private path reported when truncation occurs.
 The most recent twenty exited entries are kept for `bg_logs` before older ones are discarded.

@@ -215,6 +215,25 @@ function setPendingRegistration(root: string, token: string, keepAlive: boolean,
 	writeLogRootMetadata(root, { ...metadata, [field]: [...pending] });
 }
 
+function isTrustedLogRoot(root: string): boolean {
+	try {
+		const rootStat = fs.lstatSync(root);
+		const metadataStat = fs.lstatSync(path.join(root, LOG_ROOT_METADATA));
+		const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+		return (
+			rootStat.isDirectory() &&
+			!rootStat.isSymbolicLink() &&
+			metadataStat.isFile() &&
+			!metadataStat.isSymbolicLink() &&
+			(rootStat.mode & 0o077) === 0 &&
+			(metadataStat.mode & 0o077) === 0 &&
+			(uid === undefined || (rootStat.uid === uid && metadataStat.uid === uid))
+		);
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Remove log directories belonging to pi processes that are gone.
  *
@@ -236,9 +255,17 @@ function sweepDeadLogRoots(): void {
 		const owner = /^pi-bg-(\d+)(?:-.+)?$/.exec(entry.name)?.[1];
 		if (!owner || Number(owner) === process.pid || isProcessAlive(Number(owner))) continue;
 		const root = path.join(os.tmpdir(), entry.name);
+		if (!isTrustedLogRoot(root)) continue;
 		const metadata = readLogRootMetadata(root);
-		// Missing, invalid, old-schema, or interrupted metadata is uncertain ownership.
-		if (!metadata || metadata.pendingKeepAlive.length > 0 || metadata.pendingManaged.length > 0) continue;
+		// Missing, mismatched, old-schema, or interrupted metadata is uncertain ownership.
+		if (
+			!metadata ||
+			metadata.ownerPid !== Number(owner) ||
+			metadata.pendingKeepAlive.length > 0 ||
+			metadata.pendingManaged.length > 0
+		) {
+			continue;
+		}
 		if (metadata.keepAliveGroups.some((group) => isProcessGroupIdAlive(group.pgid))) continue;
 		let uncertainManagedWriter = false;
 		for (const group of metadata.managedGroups) {

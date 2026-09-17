@@ -66,7 +66,9 @@ test("startup sweep preserves a prior metadata schema with uncertain live writer
   const logFile = path.join(root, "writer.log");
   fs.rmSync(root, { recursive: true, force: true });
   fs.mkdirSync(root, { mode: 0o700 });
-  fs.writeFileSync(path.join(root, ".owner.json"), `${JSON.stringify({ ownerPid: deadOwnerPid, keepAliveGroups: [] })}\n`);
+  fs.writeFileSync(path.join(root, ".owner.json"), `${JSON.stringify({ ownerPid: deadOwnerPid, keepAliveGroups: [] })}\n`, {
+    mode: 0o600,
+  });
   fs.writeFileSync(worker, 'setInterval(() => console.log("old-schema-tick"), 50);\n');
   const out = fs.openSync(logFile, "a", 0o600);
   const child = spawn(process.execPath, [worker], { detached: true, stdio: ["ignore", out, out] });
@@ -166,6 +168,58 @@ test("startup sweep kills managed groups left by a dead owner", { timeout: 10_00
   for (let attempt = 0; attempt < 50 && alive(workerPid); attempt++) await delay(20);
 
   assert.equal(alive(workerPid), false);
+});
+
+test("startup sweep never trusts process metadata from a non-private root", { timeout: 10_000 }, async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("safe orphan reclamation requires Linux process birth identities");
+    return;
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-bg-untrusted-sweep-"));
+  const pidFile = path.join(dir, "worker.pid");
+  const worker = path.join(dir, "worker.mjs");
+  fs.writeFileSync(
+    worker,
+    [
+      'import fs from "node:fs";',
+      `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+      'process.on("SIGTERM", () => {});',
+      'setInterval(() => {}, 1000);',
+      "",
+    ].join("\n"),
+  );
+  let workerPid: number | undefined;
+  let logRoot: string | undefined;
+  t.after(async () => {
+    if (workerPid === undefined && fs.existsSync(pidFile)) workerPid = Number(fs.readFileSync(pidFile, "utf8"));
+    if (workerPid !== undefined && alive(workerPid)) process.kill(workerPid, "SIGKILL");
+    await delay(100);
+    if (logRoot) fs.rmSync(logRoot, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const result = spawnSync(
+    path.join(projectRoot, "node_modules", ".bin", "tsx"),
+    [path.join(projectRoot, "test", "fixtures", "start-managed.ts")],
+    {
+      cwd: projectRoot,
+      env: { ...process.env, PI_BG_TEST_WORKER: worker },
+      encoding: "utf8",
+      timeout: 5_000,
+    },
+  );
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const parsed = JSON.parse(result.stdout.trim()) as { logFile: string };
+  logRoot = path.dirname(parsed.logFile);
+  fs.chmodSync(logRoot, 0o777);
+  for (let attempt = 0; attempt < 50 && !fs.existsSync(pidFile); attempt++) await delay(20);
+  workerPid = Number(fs.readFileSync(pidFile, "utf8"));
+
+  const nextSession = createHarness();
+  await nextSession.shutdown();
+
+  assert.equal(alive(workerPid), true);
+  assert.equal(fs.existsSync(logRoot), true);
 });
 
 test("startup sweep preserves a dead owner's root while a keepAlive group still writes", { timeout: 10_000 }, async (t) => {

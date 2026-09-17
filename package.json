@@ -1,8 +1,7 @@
 {
-  "name": "pi-bg",
+  "name": "@emizuki/pi-bg",
   "version": "0.1.0",
   "description": "Background processes and external-condition waits for pi: run a server, wait for CI, without blocking a turn.",
-  "private": true,
   "type": "module",
   "scripts": {
     "test": "tsx --test --test-concurrency=1 test/*.test.ts",
@@ -13,6 +12,22 @@
     "pi-package"
   ],
   "license": "MIT",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/emizuki/pi-bg.git"
+  },
+  "homepage": "https://github.com/emizuki/pi-bg#readme",
+  "bugs": {
+    "url": "https://github.com/emizuki/pi-bg/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "pi": {
     "extensions": [
       "./extensions"

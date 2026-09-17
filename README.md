@@ -10,6 +10,12 @@ a subagent package.
 ## Install
 
 ```bash
+pi install npm:@emizuki/pi-bg
+```
+
+To track the development branch directly instead:
+
+```bash
 pi install git:github.com/emizuki/pi-bg
 ```
 

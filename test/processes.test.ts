@@ -85,7 +85,25 @@ test("session shutdown immediately kills an entry that is already stopping", { t
 
   await harness.execute("bg_stop", { id: idFrom(started.details) });
   await harness.shutdown();
-  await delay(200);
+
+  assert.equal(processAlive(workerPid), false);
+});
+
+test("session shutdown kills a keepAlive entry that was already stopping", { timeout: 4_000 }, async (t) => {
+  const { dir, pidFile } = makeIgnoringWorker();
+  const harness = createHarness({ cwd: dir });
+  let workerPid: number | undefined;
+  t.after(() => cleanWorker(harness, dir, workerPid));
+  const started = await harness.execute("bg_start", {
+    command: `cd "${dir}" && node worker.mjs`,
+    name: "keepalive-stopping",
+    keepAlive: true,
+  });
+  await waitFor(() => fs.existsSync(pidFile));
+  workerPid = Number(fs.readFileSync(pidFile, "utf8"));
+
+  await harness.execute("bg_stop", { id: idFrom(started.details) });
+  await harness.shutdown();
 
   assert.equal(processAlive(workerPid), false);
 });
@@ -100,6 +118,22 @@ test("background logs are owner-only", async (t) => {
 
   assert.equal(fs.statSync(path.dirname(resolvedLogFile)).mode & 0o777, 0o700);
   assert.equal(fs.statSync(resolvedLogFile).mode & 0o777, 0o600);
+});
+
+test("an exited shell leader does not announce exit while its process group is alive", { timeout: 4_000 }, async (t) => {
+  const harness = createHarness();
+  t.after(() => harness.shutdown());
+  const started = await harness.execute("bg_start", {
+    command: "sleep 5 & echo launched",
+    name: "background-descendant",
+  });
+  const id = idFrom(started.details);
+
+  await delay(1_700);
+
+  assert.equal(harness.notifications.length, 0);
+  assert.match(resultText(await harness.execute("bg_list")), new RegExp(`${id}.*running`));
+  await harness.execute("bg_stop", { id });
 });
 
 test("exited process history is pruned when children close", { timeout: 5_000 }, async (t) => {
@@ -137,16 +171,16 @@ test("a synchronous spawn failure cleans up its log descriptor", async (t) => {
   assert.equal(fs.readdirSync("/proc/self/fd").length, before);
 });
 
-test("an asynchronous spawn failure sends only one failure notification", { timeout: 4_000 }, async (t) => {
+test("an asynchronous spawn failure rejects the starting tool call", async (t) => {
   const harness = createHarness();
   t.after(() => harness.shutdown());
   const missingCwd = path.join(os.tmpdir(), `pi-bg-missing-${process.pid}-${Date.now()}`);
 
-  await harness.execute("bg_start", { command: "true", cwd: missingCwd, name: "missing-cwd" });
-  await delay(1_700);
+  await assert.rejects(
+    harness.execute("bg_start", { command: "true", cwd: missingCwd, name: "missing-cwd" }),
+    /failed to start|ENOENT/,
+  );
 
-  assert.equal(harness.notifications.length, 1);
-  const body = harness.notifications[0]?.message.content ?? "";
-  assert.match(body, /failed to start/);
-  assert.doesNotMatch(body, /exited -?\d/);
+  assert.equal(harness.notifications.length, 0);
+  assert.equal(resultText(await harness.execute("bg_list")), "Nothing running.");
 });

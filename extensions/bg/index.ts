@@ -28,12 +28,15 @@ import {
 import { Type } from "typebox";
 
 const LOG_ROOT_PREFIX = path.join(os.tmpdir(), `pi-bg-${process.pid}-`);
-let logRoot: string | undefined;
+const LOG_ROOT_METADATA = ".owner.json";
 const DEFAULT_WATCH_INTERVAL_MS = 60_000;
 const DEFAULT_WATCH_TIMEOUT_MS = 60 * 60_000;
 /** Below this, polling an API like `gh` costs more in rate limit than it saves in latency. */
 const MIN_WATCH_INTERVAL_MS = 5_000;
 const SIGKILL_GRACE_MS = 5_000;
+const PROCESS_GROUP_PROBE_MS = 25;
+const SHUTDOWN_WAIT_MS = 2_000;
+const MAX_TIMER_MS = 2_147_483_647;
 const LOG_TAIL_DEFAULT = 40;
 /** Notifications are coalesced over this window so five things finishing is one turn, not five. */
 const NUDGE_HOLD_MS = 1_500;
@@ -53,7 +56,12 @@ interface BgProcess {
 	stopping: boolean;
 	logFd?: number;
 	spawnError?: string;
+	groupDead: boolean;
+	finalized: boolean;
 	escalationTimer?: ReturnType<typeof setTimeout>;
+	groupMonitor?: ReturnType<typeof setInterval>;
+	closed: Promise<void>;
+	resolveClosed: () => void;
 	child: ChildProcess;
 }
 
@@ -76,36 +84,21 @@ interface BgWatch {
 	controller: AbortController;
 	done: Promise<void>;
 	resolveDone: () => void;
+	activePoll?: Promise<void>;
 	timer?: ReturnType<typeof setInterval>;
 	deadlineTimer?: ReturnType<typeof setTimeout>;
 }
 
-const running = new Map<string, BgProcess>();
 /** Exited entries are kept so bg_logs still works, but not forever. */
 const MAX_REMEMBERED_EXITS = 20;
 
-function pruneExited(): void {
-	const exited = [...running.values()].filter((entry) => !isAlive(entry)).sort((a, b) => (a.exitedAt ?? 0) - (b.exitedAt ?? 0));
-	for (const entry of exited.slice(0, Math.max(0, exited.length - MAX_REMEMBERED_EXITS))) {
-		running.delete(entry.id);
-		try {
-			fs.rmSync(entry.logFile, { force: true });
-		} catch {
-			/* ignore */
-		}
-	}
+interface LogRootMetadata {
+	ownerPid: number;
+	keepAliveGroups: number[];
 }
-const watches = new Map<string, BgWatch>();
 
 function shortId(): string {
 	return randomUUID().slice(0, 8);
-}
-
-function ensureLogRoot(): string {
-	if (logRoot !== undefined) return logRoot;
-	logRoot = fs.mkdtempSync(LOG_ROOT_PREFIX);
-	fs.chmodSync(logRoot, 0o700);
-	return logRoot;
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -118,13 +111,51 @@ function isProcessAlive(pid: number): boolean {
 	}
 }
 
+function isProcessGroupIdAlive(pgid: number): boolean {
+	try {
+		process.kill(-pgid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException)?.code === "EPERM";
+	}
+}
+
+function readLogRootMetadata(root: string): LogRootMetadata | undefined {
+	try {
+		const value = JSON.parse(fs.readFileSync(path.join(root, LOG_ROOT_METADATA), "utf8")) as Partial<LogRootMetadata>;
+		if (!Number.isInteger(value.ownerPid) || !Array.isArray(value.keepAliveGroups)) return undefined;
+		return {
+			ownerPid: value.ownerPid as number,
+			keepAliveGroups: value.keepAliveGroups.filter((group): group is number => Number.isInteger(group) && group > 0),
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function writeLogRootMetadata(root: string, metadata: LogRootMetadata): void {
+	const target = path.join(root, LOG_ROOT_METADATA);
+	const temporary = path.join(root, `${LOG_ROOT_METADATA}.${process.pid}.${shortId()}.tmp`);
+	fs.writeFileSync(temporary, `${JSON.stringify(metadata)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+	fs.chmodSync(temporary, 0o600);
+	fs.renameSync(temporary, target);
+}
+
+function setKeepAliveGroup(root: string, pgid: number, keep: boolean): void {
+	const metadata = readLogRootMetadata(root) ?? { ownerPid: process.pid, keepAliveGroups: [] };
+	const groups = new Set(metadata.keepAliveGroups);
+	if (keep) groups.add(pgid);
+	else groups.delete(pgid);
+	writeLogRootMetadata(root, { ...metadata, keepAliveGroups: [...groups] });
+}
+
 /**
  * Remove log directories belonging to pi processes that are gone.
  *
  * Shutdown cleanup alone is not enough: a killed process never runs it, and whether
  * `session_shutdown` reaches every kind of session is not something this extension should bet on.
- * Ownership is in the directory name, so liveness is the test — no age heuristic needed, and a
- * running session's logs are never touched.
+ * The directory name identifies its Pi owner, while private metadata records keepAlive groups.
+ * Sweeping requires both owner and writers to be gone; no age heuristic can delete a live log.
  */
 function sweepDeadLogRoots(): void {
 	let entries: fs.Dirent[];
@@ -137,8 +168,11 @@ function sweepDeadLogRoots(): void {
 		if (!entry.isDirectory()) continue;
 		const owner = /^pi-bg-(\d+)(?:-.+)?$/.exec(entry.name)?.[1];
 		if (!owner || Number(owner) === process.pid || isProcessAlive(Number(owner))) continue;
+		const root = path.join(os.tmpdir(), entry.name);
+		const metadata = readLogRootMetadata(root);
+		if (metadata?.keepAliveGroups.some(isProcessGroupIdAlive)) continue;
 		try {
-			fs.rmSync(path.join(os.tmpdir(), entry.name), { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
 		} catch {
 			/* another process may be removing it */
 		}
@@ -146,18 +180,18 @@ function sweepDeadLogRoots(): void {
 }
 
 function isProcessGroupAlive(entry: BgProcess): boolean {
+	if (entry.groupDead) return false;
 	const pid = entry.child.pid;
 	if (pid === undefined) return false;
-	try {
-		process.kill(-pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException)?.code === "EPERM";
-	}
+	const alive = isProcessGroupIdAlive(pid);
+	// Once absence has been observed after leader exit, this entry must never become live again if
+	// the numeric PGID is later reused by an unrelated process group.
+	if (!alive && entry.exitedAt !== undefined) entry.groupDead = true;
+	return alive;
 }
 
 function isAlive(entry: BgProcess): boolean {
-	return entry.exitedAt === undefined || isProcessGroupAlive(entry);
+	return !entry.finalized && (entry.exitedAt === undefined || isProcessGroupAlive(entry));
 }
 
 function closeLog(entry: BgProcess): void {
@@ -190,13 +224,6 @@ interface BoundedOutput {
 	text: string;
 	truncated: boolean;
 	fullOutputPath?: string;
-}
-
-function writePrivateSnapshot(prefix: string, content: string): string {
-	const file = path.join(ensureLogRoot(), `${prefix}-${shortId()}.log`);
-	fs.writeFileSync(file, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
-	fs.chmodSync(file, 0o600);
-	return file;
 }
 
 function boundToolOutput(content: string, keep: "head" | "tail", fullOutputPath: () => string): BoundedOutput {
@@ -324,7 +351,6 @@ function terminate(entry: BgProcess, immediate = false): void {
 	entry.escalationTimer = setTimeout(() => {
 		entry.escalationTimer = undefined;
 		if (isAlive(entry)) signalGroup(entry, "SIGKILL");
-		pruneExited();
 	}, SIGKILL_GRACE_MS);
 	entry.escalationTimer.unref?.();
 }
@@ -332,6 +358,49 @@ function terminate(entry: BgProcess, immediate = false): void {
 export default function (pi: ExtensionAPI) {
 	sweepDeadLogRoots();
 	let active = true;
+	let logRoot: string | undefined;
+	const running = new Map<string, BgProcess>();
+	const watches = new Map<string, BgWatch>();
+
+	function ensureLogRoot(): string {
+		if (logRoot !== undefined) return logRoot;
+		const created = fs.mkdtempSync(LOG_ROOT_PREFIX);
+		try {
+			fs.chmodSync(created, 0o700);
+			writeLogRootMetadata(created, { ownerPid: process.pid, keepAliveGroups: [] });
+			logRoot = created;
+			return created;
+		} catch (error) {
+			fs.rmSync(created, { recursive: true, force: true });
+			throw error;
+		}
+	}
+
+	function writePrivateSnapshot(prefix: string, content: string): string {
+		const file = path.join(ensureLogRoot(), `${prefix}-${shortId()}.log`);
+		fs.writeFileSync(file, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+		fs.chmodSync(file, 0o600);
+		return file;
+	}
+
+	function toolError(message: string): Error {
+		const output = boundToolOutput(message, "tail", () => writePrivateSnapshot("error", message));
+		return new Error(output.text);
+	}
+
+	function pruneExited(): void {
+		const exited = [...running.values()]
+			.filter((entry) => !isAlive(entry))
+			.sort((a, b) => (a.exitedAt ?? 0) - (b.exitedAt ?? 0));
+		for (const entry of exited.slice(0, Math.max(0, exited.length - MAX_REMEMBERED_EXITS))) {
+			running.delete(entry.id);
+			try {
+				fs.rmSync(entry.logFile, { force: true });
+			} catch {
+				/* ignore */
+			}
+		}
+	}
 
 	/**
 	 * Coalesce notifications per key: several watches finishing together should wake the session
@@ -351,13 +420,71 @@ export default function (pi: ExtensionAPI) {
 			const body = pendingLines.join("\n\n");
 			pendingLines = [];
 			if (!active || body === "") return;
+			const output = boundToolOutput(body, "tail", () => writePrivateSnapshot("notification", body));
 			try {
-				pi.sendMessage({ customType: "pi-bg", content: body, display: true }, { deliverAs: "followUp", triggerTurn: true });
+				pi.sendMessage(
+					{ customType: "pi-bg", content: output.text, display: true },
+					{ deliverAs: "followUp", triggerTurn: true },
+				);
 			} catch {
 				/* the session may have been replaced between the active check and delivery */
 			}
 		}, NUDGE_HOLD_MS);
 		nudgeTimer.unref?.();
+	}
+
+	function recordKeepAliveGroup(entry: BgProcess, keep: boolean): void {
+		if (!entry.keepAlive || entry.child.pid === undefined) return;
+		const root = path.dirname(entry.logFile);
+		try {
+			setKeepAliveGroup(root, entry.child.pid, keep);
+		} catch (error) {
+			if (keep) throw error;
+			/* the scratch root may already have been removed during shutdown */
+		}
+	}
+
+	function finalizeProcessExit(entry: BgProcess): void {
+		if (entry.finalized) return;
+		entry.finalized = true;
+		entry.groupDead = true;
+		if (entry.groupMonitor) clearInterval(entry.groupMonitor);
+		if (entry.escalationTimer) clearTimeout(entry.escalationTimer);
+		entry.groupMonitor = undefined;
+		entry.escalationTimer = undefined;
+		recordKeepAliveGroup(entry, false);
+		if (!entry.spawnError && !entry.stopping && entry.exitCode !== null) {
+			notify(
+				`Background process ${entry.id} (${entry.name}) exited ${entry.signal ?? entry.exitCode} after ${elapsed(entry.startedAt, entry.exitedAt)}.\nLast output:\n${tailFile(entry.logFile, 10)}`,
+			);
+		} else if (!entry.spawnError && !entry.stopping && entry.signal) {
+			notify(
+				`Background process ${entry.id} (${entry.name}) was killed by ${entry.signal} after ${elapsed(entry.startedAt, entry.exitedAt)}.\nLast output:\n${tailFile(entry.logFile, 10)}`,
+			);
+		}
+		pruneExited();
+		entry.resolveClosed();
+	}
+
+	function monitorProcessGroup(entry: BgProcess): void {
+		if (entry.finalized || entry.exitedAt === undefined) return;
+		if (!isProcessGroupAlive(entry)) {
+			finalizeProcessExit(entry);
+			return;
+		}
+		if (entry.groupMonitor) return;
+		entry.groupMonitor = setInterval(() => {
+			if (!isProcessGroupAlive(entry)) finalizeProcessExit(entry);
+		}, PROCESS_GROUP_PROBE_MS);
+		entry.groupMonitor.unref?.();
+	}
+
+	async function waitForProcessClose(entry: BgProcess): Promise<void> {
+		if (entry.finalized) return;
+		await Promise.race([
+			entry.closed,
+			new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_WAIT_MS)),
+		]);
 	}
 
 	function settleWatch(
@@ -444,7 +571,7 @@ export default function (pi: ExtensionAPI) {
 			// `cmd &` makes sh exit 0 at once, so the entry is marked exited while the real work is
 			// untracked and unstoppable. Validate before opening a log so rejection cannot leak an fd.
 			if (/&\s*$/.test(params.command.trim())) {
-				throw new Error(
+				throw toolError(
 					"Drop the trailing '&': bg_start already runs the command in the background, and a self-backgrounding command exits immediately, leaving the real process untracked.",
 				);
 			}
@@ -467,16 +594,36 @@ export default function (pi: ExtensionAPI) {
 					detached: true,
 					stdio: ["ignore", out, out],
 				});
+				await new Promise<void>((resolve, reject) => {
+					const cleanup = () => {
+						child.removeListener("spawn", onSpawn);
+						child.removeListener("error", onError);
+					};
+					const onSpawn = () => {
+						cleanup();
+						resolve();
+					};
+					const onError = (error: Error) => {
+						cleanup();
+						reject(error);
+					};
+					child.once("spawn", onSpawn);
+					child.once("error", onError);
+				});
 			} catch (error) {
 				try {
 					fs.closeSync(out);
 				} finally {
 					fs.rmSync(logFile, { force: true });
 				}
-				throw error;
+				throw toolError(`Background process ${id} failed to start: ${(error as Error).message}`);
 			}
 			child.unref();
 
+			let resolveClosed!: () => void;
+			const closed = new Promise<void>((resolve) => {
+				resolveClosed = resolve;
+			});
 			const entry: BgProcess = {
 				id,
 				name: params.name ?? params.command.trim().split(/\s+/)[0],
@@ -487,8 +634,21 @@ export default function (pi: ExtensionAPI) {
 				keepAlive,
 				stopping: false,
 				logFd: out,
+				groupDead: false,
+				finalized: false,
+				closed,
+				resolveClosed,
 				child,
 			};
+			try {
+				recordKeepAliveGroup(entry, true);
+			} catch (error) {
+				entry.stopping = true;
+				signalGroup(entry, "SIGKILL");
+				closeLog(entry);
+				fs.rmSync(logFile, { force: true });
+				throw toolError(`Background process ${id} failed to register keepAlive ownership: ${(error as Error).message}`);
+			}
 			running.set(id, entry);
 			pruneExited();
 
@@ -504,35 +664,29 @@ export default function (pi: ExtensionAPI) {
 				}
 				notify(`Background process ${id} (${entry.name}) failed to start: ${error.message}`);
 			});
-			// `close` rather than `exit`: a spawn that fails emits error and close but never exit, so
-			// closing the log there leaked a descriptor on every failed start.
 			child.on("close", (code, signal) => {
 				entry.exitedAt ??= Date.now();
 				if (entry.exitCode === undefined) entry.exitCode = code;
 				entry.signal = signal;
 				closeLog(entry);
-				// Keyed on whether we asked for it, not on which signal arrived: an OOM kill or a
-				// `kill` from another terminal is exactly the unexpected death worth reporting.
-				if (!entry.spawnError && !entry.stopping && code !== null) {
-					notify(
-						`Background process ${id} (${entry.name}) exited ${signal ?? code} after ${elapsed(entry.startedAt, entry.exitedAt)}.\nLast output:\n${tailFile(logFile, 10)}`,
-					);
-				} else if (!entry.spawnError && !entry.stopping && signal) {
-					notify(
-						`Background process ${id} (${entry.name}) was killed by ${signal} after ${elapsed(entry.startedAt, entry.exitedAt)}.\nLast output:\n${tailFile(logFile, 10)}`,
-					);
-				}
-				pruneExited();
+				// The shell leader can exit while descendants remain. Completion belongs to the
+				// process group, so notification, pruning, and shutdown barriers wait for group death.
+				monitorProcessGroup(entry);
 			});
 
+			const raw = `Started ${id} (${entry.name})${keepAlive ? ", detached from this session" : ""}. Logs: bg_logs { id: "${id}" }.`;
+			const output = boundToolOutput(raw, "head", () => writePrivateSnapshot("start", raw));
 			return {
-				content: [
-					{
-						type: "text",
-						text: `Started ${id} (${entry.name})${keepAlive ? ", detached from this session" : ""}. Logs: bg_logs { id: "${id}" }.`,
-					},
-				],
-				details: { id, name: entry.name, cwd, logFile, keepAlive },
+				content: [{ type: "text", text: output.text }],
+				details: {
+					id,
+					name: entry.name,
+					cwd,
+					logFile,
+					keepAlive,
+					truncated: output.truncated,
+					fullOutputPath: output.fullOutputPath,
+				},
 			};
 		},
 	});
@@ -576,7 +730,7 @@ export default function (pi: ExtensionAPI) {
 			const entry = running.get(params.id);
 			if (!entry) {
 				const known = [...running.keys()].join(", ") || "none";
-				throw new Error(`No process "${params.id}". Known: ${known}.`);
+				throw toolError(`No process "${params.id}". Known: ${known}.`);
 			}
 			const requestedTail = Math.max(1, params.tail ?? LOG_TAIL_DEFAULT);
 			const tail = tailFile(entry.logFile, requestedTail);
@@ -606,23 +760,43 @@ export default function (pi: ExtensionAPI) {
 				settleWatch(watch, "cancelled", `Watch ${watch.id} cancelled.`, false);
 				return {
 					content: [{ type: "text", text: `Cancelled watch ${watch.id}.` }],
-					details: { id: watch.id, kind: "watch", state: watch.state },
+					details: {
+						id: watch.id,
+						kind: "watch",
+						state: watch.state,
+						truncated: false,
+						fullOutputPath: undefined as string | undefined,
+					},
 				};
 			}
 			const entry = running.get(params.id);
 			if (!entry) {
-				throw new Error(`No process or watch "${params.id}".`);
+				throw toolError(`No process or watch "${params.id}".`);
 			}
 			if (!isAlive(entry)) {
 				return {
 					content: [{ type: "text", text: `${entry.id} already exited.` }],
-					details: { id: entry.id, kind: "process", state: "exited" },
+					details: {
+						id: entry.id,
+						kind: "process",
+						state: "exited",
+						truncated: false,
+						fullOutputPath: undefined as string | undefined,
+					},
 				};
 			}
 			terminate(entry);
+			const raw = `Stopping ${entry.id} (${entry.name}).`;
+			const output = boundToolOutput(raw, "head", () => writePrivateSnapshot("stop", raw));
 			return {
-				content: [{ type: "text", text: `Stopping ${entry.id} (${entry.name}).` }],
-				details: { id: entry.id, kind: "process", state: "stopping" },
+				content: [{ type: "text", text: output.text }],
+				details: {
+					id: entry.id,
+					kind: "process",
+					state: "stopping",
+					truncated: output.truncated,
+					fullOutputPath: output.fullOutputPath,
+				},
 			};
 		},
 	});
@@ -643,9 +817,14 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			intervalMs: Type.Optional(
-				Type.Number({ description: `Poll interval; default ${DEFAULT_WATCH_INTERVAL_MS}, minimum ${MIN_WATCH_INTERVAL_MS}` }),
+				Type.Number({
+					description: `Poll interval; default ${DEFAULT_WATCH_INTERVAL_MS}, minimum ${MIN_WATCH_INTERVAL_MS}`,
+					maximum: MAX_TIMER_MS,
+				}),
 			),
-			timeoutMs: Type.Optional(Type.Number({ description: `Give up after this long; default ${DEFAULT_WATCH_TIMEOUT_MS}` })),
+			timeoutMs: Type.Optional(
+				Type.Number({ description: `Give up after this long; default ${DEFAULT_WATCH_TIMEOUT_MS}`, maximum: MAX_TIMER_MS }),
+			),
 			cwd: Type.Optional(Type.String({ description: "Working directory; defaults to the session's" })),
 			label: Type.Optional(Type.String({ description: "What you are waiting for, shown in listings and the notification" })),
 		}),
@@ -655,12 +834,20 @@ export default function (pi: ExtensionAPI) {
 				try {
 					pattern = new RegExp(params.until);
 				} catch (error) {
-					throw new Error(`Invalid "until" regex: ${(error as Error).message}`);
+					throw toolError(`Invalid "until" regex: ${(error as Error).message}`);
 				}
 			}
 
+			const requestedIntervalMs = params.intervalMs ?? DEFAULT_WATCH_INTERVAL_MS;
+			const requestedTimeoutMs = params.timeoutMs ?? DEFAULT_WATCH_TIMEOUT_MS;
+			if (!Number.isFinite(requestedIntervalMs) || requestedIntervalMs > MAX_TIMER_MS) {
+				throw toolError(`intervalMs exceeds Node's timer maximum of ${MAX_TIMER_MS}.`);
+			}
+			if (!Number.isFinite(requestedTimeoutMs) || requestedTimeoutMs > MAX_TIMER_MS) {
+				throw toolError(`timeoutMs exceeds Node's timer maximum of ${MAX_TIMER_MS}.`);
+			}
 			const id = shortId();
-			const intervalMs = Math.max(MIN_WATCH_INTERVAL_MS, params.intervalMs ?? DEFAULT_WATCH_INTERVAL_MS);
+			const intervalMs = Math.max(MIN_WATCH_INTERVAL_MS, requestedIntervalMs);
 			const startedAt = Date.now();
 			let resolveDone!: () => void;
 			const done = new Promise<void>((resolve) => {
@@ -673,7 +860,7 @@ export default function (pi: ExtensionAPI) {
 				cwd: params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd,
 				until: params.until,
 				intervalMs,
-				deadline: startedAt + Math.max(0, params.timeoutMs ?? DEFAULT_WATCH_TIMEOUT_MS),
+				deadline: startedAt + Math.max(0, requestedTimeoutMs),
 				startedAt,
 				polls: 0,
 				lastPollAt: 0,
@@ -709,12 +896,17 @@ export default function (pi: ExtensionAPI) {
 				try {
 					watch.lastPollAt = Date.now();
 					const remainingMs = Math.max(1, watch.deadline - Date.now());
-					const { code, output } = await runOnce(
+					const activePoll = runOnce(
 						watch.command,
 						watch.cwd,
 						Math.min(watch.intervalMs, remainingMs),
 						watch.controller.signal,
 					);
+					watch.activePoll = activePoll.then(
+						() => undefined,
+						() => undefined,
+					);
+					const { code, output } = await activePoll;
 					if (watch.state !== "watching") return;
 					watch.polls++;
 					watch.lastOutput = output.slice(-4_000);
@@ -740,6 +932,7 @@ export default function (pi: ExtensionAPI) {
 						);
 					}
 				} finally {
+					watch.activePoll = undefined;
 					polling = false;
 				}
 			};
@@ -750,15 +943,18 @@ export default function (pi: ExtensionAPI) {
 				await poll();
 
 				if (watch.state !== "watching") {
-					if (watch.state !== "met") throw new Error(watch.outcome);
+					if (watch.state !== "met") throw toolError(watch.outcome);
+					const raw = `Already true: ${watch.label}.\n${watch.lastOutput.slice(-1_500)}`;
+					const output = boundToolOutput(raw, "tail", () => writePrivateSnapshot("watch", raw));
 					return {
-						content: [
-							{
-								type: "text",
-								text: `Already true: ${watch.label}.\n${watch.lastOutput.slice(-1_500)}`,
-							},
-						],
-						details: { id, state: watch.state, polls: watch.polls },
+						content: [{ type: "text", text: output.text }],
+						details: {
+							id,
+							state: watch.state,
+							polls: watch.polls,
+							truncated: output.truncated,
+							fullOutputPath: output.fullOutputPath,
+						},
 					};
 				}
 
@@ -766,29 +962,35 @@ export default function (pi: ExtensionAPI) {
 				if (ctx.hasUI) {
 					watch.notifyOnFinish = true;
 					watch.timer.unref?.();
+					const raw = `Watching ${id}: ${watch.label}, every ${Math.round(intervalMs / 1000)}s. You will be told when it is met. Carry on with other work.`;
+					const output = boundToolOutput(raw, "head", () => writePrivateSnapshot("watch", raw));
 					return {
-						content: [
-							{
-								type: "text",
-								text: `Watching ${id}: ${watch.label}, every ${Math.round(intervalMs / 1000)}s. You will be told when it is met. Carry on with other work.`,
-							},
-						],
-						details: { id, state: watch.state, polls: watch.polls },
+						content: [{ type: "text", text: output.text }],
+						details: {
+							id,
+							state: watch.state,
+							polls: watch.polls,
+							truncated: output.truncated,
+							fullOutputPath: output.fullOutputPath,
+						},
 					};
 				}
 
 				// Print and JSON modes have no later delivery channel, so the tool owns the wait.
 				await watch.done;
 				const finalState = watch.state as BgWatch["state"];
-				if (finalState !== "met") throw new Error(watch.outcome);
+				if (finalState !== "met") throw toolError(watch.outcome);
+				const raw = `Watch met after ${elapsed(watch.startedAt)}: ${watch.label}.\n${watch.lastOutput.slice(-1_500)}`;
+				const output = boundToolOutput(raw, "tail", () => writePrivateSnapshot("watch", raw));
 				return {
-					content: [
-						{
-							type: "text",
-							text: `Watch met after ${elapsed(watch.startedAt)}: ${watch.label}.\n${watch.lastOutput.slice(-1_500)}`,
-						},
-					],
-					details: { id, state: finalState, polls: watch.polls },
+					content: [{ type: "text", text: output.text }],
+					details: {
+						id,
+						state: finalState,
+						polls: watch.polls,
+						truncated: output.truncated,
+						fullOutputPath: output.fullOutputPath,
+					},
 				};
 			} finally {
 				signal?.removeEventListener("abort", onAbort);
@@ -796,19 +998,24 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
 		if (!active) return;
 		active = false;
-		for (const watch of [...watches.values()]) {
+		const ownedWatches = [...watches.values()];
+		const activePolls = ownedWatches.flatMap((watch) => (watch.activePoll ? [watch.activePoll] : []));
+		for (const watch of ownedWatches) {
 			settleWatch(watch, "cancelled", `Watch ${watch.id} cancelled by session shutdown.`, false);
 		}
 		if (nudgeTimer) clearTimeout(nudgeTimer);
 		nudgeTimer = undefined;
 		pendingLines = [];
+		await Promise.allSettled(activePolls);
+
 		let survivors = 0;
+		const closing: Promise<void>[] = [];
 		for (const entry of running.values()) {
-			// keepAlive is the whole point of keepAlive: leave those running.
-			if (entry.keepAlive && isAlive(entry)) {
+			// A keepAlive process survives only if the user has not already asked bg_stop to end it.
+			if (entry.keepAlive && !entry.stopping && isAlive(entry)) {
 				survivors++;
 				closeLog(entry);
 				continue;
@@ -817,7 +1024,9 @@ export default function (pi: ExtensionAPI) {
 			// reaches it, so a child that ignores SIGTERM would outlive the session it belongs to.
 			terminate(entry, true);
 			closeLog(entry);
+			closing.push(waitForProcessClose(entry));
 		}
+		await Promise.allSettled(closing);
 		running.clear();
 		// Logs of a process that is still running are still being written to; everything else is
 		// scratch that would otherwise sit in /tmp forever.

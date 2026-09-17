@@ -144,6 +144,28 @@ test("session shutdown suppresses completion from an in-flight poll", { timeout:
   assert.equal(harness.notifications.length, 0);
 });
 
+test("session shutdown waits for an active poll process to close", { timeout: 3_000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-bg-watch-shutdown-"));
+  const pidFile = path.join(dir, "poll.pid");
+  const harness = createHarness({ cwd: dir });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const execution = harness.execute("bg_watch", {
+    command: `echo $$ > "${pidFile}"; sleep 5`,
+    timeoutMs: 10_000,
+  });
+  const settled = execution.then(
+    () => undefined,
+    () => undefined,
+  );
+  await waitFor(() => fs.existsSync(pidFile), 1_000);
+  const pollPid = Number(fs.readFileSync(pidFile, "utf8"));
+
+  await harness.shutdown();
+  await settled;
+
+  assert.throws(() => process.kill(pollPid, 0));
+});
+
 test("a synchronous poll spawn failure leaves no registered watch", async (t) => {
   const harness = createHarness();
   t.after(() => harness.shutdown());
@@ -153,4 +175,28 @@ test("a synchronous poll spawn failure leaves no registered watch", async (t) =>
   );
 
   assert.equal(resultText(await harness.execute("bg_list")), "Nothing running.");
+});
+
+test("bg_watch rejects deadlines above Node's timer maximum", async (t) => {
+  const harness = createHarness();
+  t.after(() => harness.shutdown());
+
+  await assert.rejects(
+    harness.execute("bg_watch", { command: "false", timeoutMs: 3_000_000_000 }),
+    /maximum|too large/i,
+  );
+});
+
+test("bg_watch rejects intervals above Node's timer maximum", async (t) => {
+  const harness = createHarness();
+  t.after(() => harness.shutdown());
+
+  await assert.rejects(
+    harness.execute("bg_watch", {
+      command: "false",
+      intervalMs: 3_000_000_000,
+      timeoutMs: 10_000,
+    }),
+    /maximum|too large/i,
+  );
 });

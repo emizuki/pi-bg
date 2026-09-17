@@ -35,8 +35,8 @@ bg_stop  b00f2c2a             -> Stopping b00f2c2a (npm).
 `keepAlive` is off by default, so a process is stopped when the session ends. An orphaned server
 holding a port is harder to find than it is to restart. Pass `keepAlive: true` to detach one
 deliberately. At that session boundary the process becomes unmanaged: it keeps running and writing
-to its private log, but callbacks from the old session are disabled and later sessions do not list
-or stop it.
+to its private log, but no notification is sent through the old session and later sessions do not
+list or stop it.
 
 Stopping signals the process **group**, not just the shell pi spawned. With `shell: true` a
 command containing any shell operator — `cd app && npm run dev` — runs as a grandchild, and
@@ -86,14 +86,15 @@ together produce one turn rather than five.
 
 Logs live in a randomly suffixed, owner-only (`0700`) directory named after the pi process that
 owns them; files are `0600`. The directory is removed at session shutdown unless a `keepAlive`
-process still writes there, and any directory whose owning process is gone is swept at startup.
-Only the last 64 KB of a log is read internally, and every tool result is capped at Pi's 50 KB /
-2000-line limit with the full private path reported when truncation occurs. The most recent twenty
-exited entries are kept for `bg_logs` before older ones are discarded.
+process still writes there. Each root records live keepAlive process groups, so startup sweeping
+preserves a dead owner's root while one of those groups still writes and removes it once both owner
+and writers are gone. Only the last 64 KB of a log is read internally, and every tool result is
+capped at Pi's 50 KB / 2000-line limit with the full private path reported when truncation occurs.
+The most recent twenty exited entries are kept for `bg_logs` before older ones are discarded.
 
 The second half matters: a killed process never runs its shutdown handler, and cleanup that
-depends on a single event is cleanup that silently stops happening. Liveness is checked with
-`kill(pid, 0)`, so a running session's logs are never touched no matter how old they are.
+depends on a single event is cleanup that silently stops happening. Owner and process-group
+liveness are checked with `kill(pid, 0)`, so live writers' logs are never swept based on age.
 
 ## Checks
 
@@ -102,11 +103,6 @@ test suite. The tests exercise real detached process groups, cancellation/deadli
 shutdown, permissions, output bounds, and failure cleanup.
 
 ## Known limits
-
-State is module-scoped and teardown is per-session. If pi ever activates this extension for more
-than one session inside a single process, they would share the process table, the watch table and
-the log directory, and one session's shutdown would stop the other's work. Whether that is
-reachable depends on pi's host behaviour, which has not been verified here.
 
 `bg_watch` runs its first poll before returning, in every mode, so a slow poll command delays even
 the interactive path by that one poll. The poll is capped by the smaller of the watch interval and

@@ -86,9 +86,11 @@ together produce one turn rather than five.
 
 Logs live in a randomly suffixed, owner-only (`0700`) directory named after the pi process that
 owns them; files are `0600`. The directory is removed at session shutdown unless a `keepAlive`
-process still writes there. Each root records live keepAlive process groups, so startup sweeping
-preserves a dead owner's root while one of those groups still writes and removes it once both owner
-and writers are gone. Only the last 64 KB of a log is read internally, and every tool result is
+process still writes there. Each root records pending registrations and live keepAlive process
+groups, so startup sweeping preserves a dead owner's root while one of those groups may still write
+and removes it once ownership is known and both owner and writers are gone. Legacy or malformed
+roots with uncertain ownership are conservatively left untouched. Only the last 64 KB of a log is
+read internally, and every tool result is
 capped at Pi's 50 KB / 2000-line limit with the full private path reported when truncation occurs.
 The most recent twenty exited entries are kept for `bg_logs` before older ones are discarded.
 
@@ -103,6 +105,10 @@ test suite. The tests exercise real detached process groups, cancellation/deadli
 shutdown, permissions, output bounds, and failure cleanup.
 
 ## Known limits
+
+Roots created by versions that predate ownership metadata cannot be swept safely and may require
+manual removal once their writers are known to be gone. Commands that deliberately daemonize into
+a different process group cannot be managed after they leave the group pi-bg created.
 
 `bg_watch` runs its first poll before returning, in every mode, so a slow poll command delays even
 the interactive path by that one poll. The poll is capped by the smaller of the watch interval and

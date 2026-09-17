@@ -166,6 +166,44 @@ test("session shutdown waits for an active poll process to close", { timeout: 3_
   assert.throws(() => process.kill(pollPid, 0));
 });
 
+test("a poll waits for and cancels descendants after its shell leader exits", { timeout: 3_000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-bg-watch-descendant-"));
+  const pidFile = path.join(dir, "worker.pid");
+  const worker = path.join(import.meta.dirname, "fixtures", "poll-descendant.mjs");
+  const previousPidFile = process.env.PI_BG_TEST_PID_FILE;
+  process.env.PI_BG_TEST_PID_FILE = pidFile;
+  const harness = createHarness({ cwd: dir });
+  let workerPid: number | undefined;
+  t.after(async () => {
+    if (previousPidFile === undefined) delete process.env.PI_BG_TEST_PID_FILE;
+    else process.env.PI_BG_TEST_PID_FILE = previousPidFile;
+    if (workerPid === undefined && fs.existsSync(pidFile)) workerPid = Number(fs.readFileSync(pidFile, "utf8"));
+    if (workerPid !== undefined) {
+      try {
+        process.kill(workerPid, "SIGKILL");
+      } catch {
+        // already stopped
+      }
+    }
+    await harness.shutdown();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    harness.execute("bg_watch", {
+      command: `node "${worker}" >/dev/null 2>&1 & true`,
+      intervalMs: 5_000,
+      timeoutMs: 200,
+      label: "poll descendants",
+    }),
+    /timed out|timeout/i,
+  );
+  if (fs.existsSync(pidFile)) workerPid = Number(fs.readFileSync(pidFile, "utf8"));
+
+  const stoppedPid = workerPid;
+  if (stoppedPid !== undefined) assert.throws(() => process.kill(stoppedPid, 0));
+});
+
 test("a synchronous poll spawn failure leaves no registered watch", async (t) => {
   const harness = createHarness();
   t.after(() => harness.shutdown());

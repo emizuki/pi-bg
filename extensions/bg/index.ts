@@ -60,6 +60,7 @@ interface BgProcess {
 	finalized: boolean;
 	escalationTimer?: ReturnType<typeof setTimeout>;
 	groupMonitor?: ReturnType<typeof setInterval>;
+	ready: Promise<void>;
 	closed: Promise<void>;
 	resolveClosed: () => void;
 	child: ChildProcess;
@@ -95,6 +96,7 @@ const MAX_REMEMBERED_EXITS = 20;
 interface LogRootMetadata {
 	ownerPid: number;
 	keepAliveGroups: number[];
+	pendingKeepAlive: string[];
 }
 
 function shortId(): string {
@@ -124,9 +126,11 @@ function readLogRootMetadata(root: string): LogRootMetadata | undefined {
 	try {
 		const value = JSON.parse(fs.readFileSync(path.join(root, LOG_ROOT_METADATA), "utf8")) as Partial<LogRootMetadata>;
 		if (!Number.isInteger(value.ownerPid) || !Array.isArray(value.keepAliveGroups)) return undefined;
+		if (value.pendingKeepAlive !== undefined && !Array.isArray(value.pendingKeepAlive)) return undefined;
 		return {
 			ownerPid: value.ownerPid as number,
 			keepAliveGroups: value.keepAliveGroups.filter((group): group is number => Number.isInteger(group) && group > 0),
+			pendingKeepAlive: (value.pendingKeepAlive ?? []).filter((token): token is string => typeof token === "string"),
 		};
 	} catch {
 		return undefined;
@@ -136,17 +140,29 @@ function readLogRootMetadata(root: string): LogRootMetadata | undefined {
 function writeLogRootMetadata(root: string, metadata: LogRootMetadata): void {
 	const target = path.join(root, LOG_ROOT_METADATA);
 	const temporary = path.join(root, `${LOG_ROOT_METADATA}.${process.pid}.${shortId()}.tmp`);
-	fs.writeFileSync(temporary, `${JSON.stringify(metadata)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
-	fs.chmodSync(temporary, 0o600);
-	fs.renameSync(temporary, target);
+	try {
+		fs.writeFileSync(temporary, `${JSON.stringify(metadata)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+		fs.chmodSync(temporary, 0o600);
+		fs.renameSync(temporary, target);
+	} finally {
+		fs.rmSync(temporary, { force: true });
+	}
 }
 
 function setKeepAliveGroup(root: string, pgid: number, keep: boolean): void {
-	const metadata = readLogRootMetadata(root) ?? { ownerPid: process.pid, keepAliveGroups: [] };
+	const metadata = readLogRootMetadata(root) ?? { ownerPid: process.pid, keepAliveGroups: [], pendingKeepAlive: [] };
 	const groups = new Set(metadata.keepAliveGroups);
 	if (keep) groups.add(pgid);
 	else groups.delete(pgid);
 	writeLogRootMetadata(root, { ...metadata, keepAliveGroups: [...groups] });
+}
+
+function setKeepAlivePending(root: string, token: string, keep: boolean): void {
+	const metadata = readLogRootMetadata(root) ?? { ownerPid: process.pid, keepAliveGroups: [], pendingKeepAlive: [] };
+	const pending = new Set(metadata.pendingKeepAlive);
+	if (keep) pending.add(token);
+	else pending.delete(token);
+	writeLogRootMetadata(root, { ...metadata, pendingKeepAlive: [...pending] });
 }
 
 /**
@@ -170,7 +186,9 @@ function sweepDeadLogRoots(): void {
 		if (!owner || Number(owner) === process.pid || isProcessAlive(Number(owner))) continue;
 		const root = path.join(os.tmpdir(), entry.name);
 		const metadata = readLogRootMetadata(root);
-		if (metadata?.keepAliveGroups.some(isProcessGroupIdAlive)) continue;
+		// Missing or invalid metadata is uncertain ownership (including roots from older releases).
+		// Preserve it rather than unlink a log that an untracked keepAlive process may still write.
+		if (!metadata || metadata.pendingKeepAlive.length > 0 || metadata.keepAliveGroups.some(isProcessGroupIdAlive)) continue;
 		try {
 			fs.rmSync(root, { recursive: true, force: true });
 		} catch {
@@ -367,7 +385,7 @@ export default function (pi: ExtensionAPI) {
 		const created = fs.mkdtempSync(LOG_ROOT_PREFIX);
 		try {
 			fs.chmodSync(created, 0o700);
-			writeLogRootMetadata(created, { ownerPid: process.pid, keepAliveGroups: [] });
+			writeLogRootMetadata(created, { ownerPid: process.pid, keepAliveGroups: [], pendingKeepAlive: [] });
 			logRoot = created;
 			return created;
 		} catch (error) {
@@ -378,9 +396,14 @@ export default function (pi: ExtensionAPI) {
 
 	function writePrivateSnapshot(prefix: string, content: string): string {
 		const file = path.join(ensureLogRoot(), `${prefix}-${shortId()}.log`);
-		fs.writeFileSync(file, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
-		fs.chmodSync(file, 0o600);
-		return file;
+		try {
+			fs.writeFileSync(file, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+			fs.chmodSync(file, 0o600);
+			return file;
+		} catch (error) {
+			fs.rmSync(file, { force: true });
+			throw error;
+		}
 	}
 
 	function toolError(message: string): Error {
@@ -448,6 +471,7 @@ export default function (pi: ExtensionAPI) {
 		if (entry.finalized) return;
 		entry.finalized = true;
 		entry.groupDead = true;
+		entry.exitedAt = Date.now();
 		if (entry.groupMonitor) clearInterval(entry.groupMonitor);
 		if (entry.escalationTimer) clearTimeout(entry.escalationTimer);
 		entry.groupMonitor = undefined;
@@ -481,10 +505,17 @@ export default function (pi: ExtensionAPI) {
 
 	async function waitForProcessClose(entry: BgProcess): Promise<void> {
 		if (entry.finalized) return;
-		await Promise.race([
-			entry.closed,
-			new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_WAIT_MS)),
-		]);
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				entry.closed,
+				new Promise<void>((resolve) => {
+					timeout = setTimeout(resolve, SHUTDOWN_WAIT_MS);
+				}),
+			]);
+		} finally {
+			if (timeout) clearTimeout(timeout);
+		}
 	}
 
 	function settleWatch(
@@ -512,7 +543,7 @@ export default function (pi: ExtensionAPI) {
 		cwd: string,
 		timeoutMs: number,
 		signal: AbortSignal,
-	): Promise<{ code: number | null; output: string }> {
+	): Promise<{ code: number | null; output: string; timedOut: boolean }> {
 		return new Promise((resolve, reject) => {
 			if (signal.aborted) {
 				reject(new Error("Poll aborted."));
@@ -525,15 +556,32 @@ export default function (pi: ExtensionAPI) {
 				reject(error);
 				return;
 			}
-			const abort = () => signalChildGroup(child, "SIGKILL");
-			signal.addEventListener("abort", abort, { once: true });
-			const cap = setTimeout(abort, Math.max(1, timeoutMs));
-			cap.unref?.();
+			let output = "";
+			let leaderClosed = false;
+			let leaderCode: number | null = null;
+			let timedOut = false;
+			let settled = false;
+			let groupMonitor: ReturnType<typeof setInterval> | undefined;
+			const killGroup = () => signalChildGroup(child, "SIGKILL");
+			const onAbort = () => killGroup();
+			signal.addEventListener("abort", onAbort, { once: true });
+			const cap = setTimeout(() => {
+				timedOut = true;
+				killGroup();
+			}, Math.max(1, timeoutMs));
 			const cleanup = () => {
 				clearTimeout(cap);
-				signal.removeEventListener("abort", abort);
+				if (groupMonitor) clearInterval(groupMonitor);
+				signal.removeEventListener("abort", onAbort);
 			};
-			let output = "";
+			const finishIfGroupDead = () => {
+				if (settled || !leaderClosed) return;
+				const pid = child.pid;
+				if (pid !== undefined && isProcessGroupIdAlive(pid)) return;
+				settled = true;
+				cleanup();
+				resolve({ code: timedOut ? null : leaderCode, output, timedOut });
+			};
 			const collect = (chunk: Buffer) => {
 				output += chunk.toString();
 				if (output.length > 64_000) output = output.slice(-64_000);
@@ -541,12 +589,18 @@ export default function (pi: ExtensionAPI) {
 			child.stdout?.on("data", collect);
 			child.stderr?.on("data", collect);
 			child.once("error", (error) => {
+				if (settled) return;
+				settled = true;
 				cleanup();
 				reject(error);
 			});
 			child.once("close", (code) => {
-				cleanup();
-				resolve({ code, output });
+				leaderClosed = true;
+				leaderCode = code;
+				finishIfGroupDead();
+				if (!settled) {
+					groupMonitor = setInterval(finishIfGroupDead, PROCESS_GROUP_PROBE_MS);
+				}
 			});
 		});
 	}
@@ -581,9 +635,25 @@ export default function (pi: ExtensionAPI) {
 			// spawn would otherwise resolve a relative path against pi's own process cwd.
 			const cwd = params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd;
 			const logFile = path.join(root, `${id}.log`);
-			const out = fs.openSync(logFile, "ax", 0o600);
-			fs.fchmodSync(out, 0o600);
+			let out: number | undefined;
+			try {
+				out = fs.openSync(logFile, "ax", 0o600);
+				fs.fchmodSync(out, 0o600);
+			} catch (error) {
+				if (out !== undefined) fs.closeSync(out);
+				fs.rmSync(logFile, { force: true });
+				throw toolError(`Could not create private log for ${id}: ${(error as Error).message}`);
+			}
 			const keepAlive = params.keepAlive === true;
+			if (keepAlive) {
+				try {
+					setKeepAlivePending(root, id, true);
+				} catch (error) {
+					fs.closeSync(out);
+					fs.rmSync(logFile, { force: true });
+					throw toolError(`Could not register pending keepAlive process ${id}: ${(error as Error).message}`);
+				}
+			}
 			let child: ChildProcess;
 			try {
 				child = spawn(params.command, {
@@ -594,37 +664,61 @@ export default function (pi: ExtensionAPI) {
 					detached: true,
 					stdio: ["ignore", out, out],
 				});
-				await new Promise<void>((resolve, reject) => {
-					const cleanup = () => {
-						child.removeListener("spawn", onSpawn);
-						child.removeListener("error", onError);
-					};
-					const onSpawn = () => {
-						cleanup();
-						resolve();
-					};
-					const onError = (error: Error) => {
-						cleanup();
-						reject(error);
-					};
-					child.once("spawn", onSpawn);
-					child.once("error", onError);
-				});
 			} catch (error) {
 				try {
 					fs.closeSync(out);
 				} finally {
 					fs.rmSync(logFile, { force: true });
+					if (keepAlive) setKeepAlivePending(root, id, false);
 				}
 				throw toolError(`Background process ${id} failed to start: ${(error as Error).message}`);
 			}
-			child.unref();
 
 			let resolveClosed!: () => void;
 			const closed = new Promise<void>((resolve) => {
 				resolveClosed = resolve;
 			});
-			const entry: BgProcess = {
+			let entry!: BgProcess;
+			const ready = new Promise<void>((resolve, reject) => {
+				const cleanup = () => {
+					child.removeListener("spawn", onSpawn);
+					child.removeListener("error", onStartupError);
+				};
+				const onSpawn = () => {
+					cleanup();
+					try {
+						child.unref();
+						recordKeepAliveGroup(entry, true);
+						if (keepAlive) setKeepAlivePending(root, id, false);
+						resolve();
+					} catch (error) {
+						entry.spawnError = (error as Error).message;
+						entry.stopping = true;
+						signalGroup(entry, "SIGKILL");
+						closeLog(entry);
+						running.delete(entry.id);
+						fs.rmSync(logFile, { force: true });
+						reject(error);
+					}
+				};
+				const onStartupError = (error: Error) => {
+					cleanup();
+					entry.spawnError = error.message;
+					entry.exitCode = null;
+					entry.exitedAt = Date.now();
+					entry.groupDead = true;
+					entry.finalized = true;
+					closeLog(entry);
+					running.delete(entry.id);
+					fs.rmSync(logFile, { force: true });
+					if (keepAlive) setKeepAlivePending(root, id, false);
+					entry.resolveClosed();
+					reject(error);
+				};
+				child.once("spawn", onSpawn);
+				child.once("error", onStartupError);
+			});
+			entry = {
 				id,
 				name: params.name ?? params.command.trim().split(/\s+/)[0],
 				command: params.command,
@@ -636,34 +730,14 @@ export default function (pi: ExtensionAPI) {
 				logFd: out,
 				groupDead: false,
 				finalized: false,
+				ready,
 				closed,
 				resolveClosed,
 				child,
 			};
-			try {
-				recordKeepAliveGroup(entry, true);
-			} catch (error) {
-				entry.stopping = true;
-				signalGroup(entry, "SIGKILL");
-				closeLog(entry);
-				fs.rmSync(logFile, { force: true });
-				throw toolError(`Background process ${id} failed to register keepAlive ownership: ${(error as Error).message}`);
-			}
 			running.set(id, entry);
 			pruneExited();
 
-			child.on("error", (error) => {
-				entry.exitedAt ??= Date.now();
-				entry.exitCode = null;
-				entry.spawnError = error.message;
-				closeLog(entry);
-				try {
-					fs.appendFileSync(logFile, `\n[pi-bg] failed to start: ${error.message}\n`);
-				} catch {
-					/* shutdown may already have removed the scratch log */
-				}
-				notify(`Background process ${id} (${entry.name}) failed to start: ${error.message}`);
-			});
 			child.on("close", (code, signal) => {
 				entry.exitedAt ??= Date.now();
 				if (entry.exitCode === undefined) entry.exitCode = code;
@@ -673,6 +747,25 @@ export default function (pi: ExtensionAPI) {
 				// process group, so notification, pruning, and shutdown barriers wait for group death.
 				monitorProcessGroup(entry);
 			});
+
+			try {
+				await ready;
+			} catch (error) {
+				throw toolError(`Background process ${id} failed to start: ${(error as Error).message}`);
+			}
+			child.on("error", (error) => {
+				entry.exitedAt ??= Date.now();
+				entry.exitCode = null;
+				entry.spawnError = error.message;
+				closeLog(entry);
+				try {
+					fs.appendFileSync(logFile, `\n[pi-bg] process error: ${error.message}\n`);
+				} catch {
+					/* shutdown may already have removed the scratch log */
+				}
+				notify(`Background process ${id} (${entry.name}) failed: ${error.message}`);
+			});
+			if (!active) throw toolError(`Background process ${id} was cancelled by session shutdown.`);
 
 			const raw = `Started ${id} (${entry.name})${keepAlive ? ", detached from this session" : ""}. Logs: bg_logs { id: "${id}" }.`;
 			const output = boundToolOutput(raw, "head", () => writePrivateSnapshot("start", raw));
@@ -906,7 +999,7 @@ export default function (pi: ExtensionAPI) {
 						() => undefined,
 						() => undefined,
 					);
-					const { code, output } = await activePoll;
+					const { code, output, timedOut } = await activePoll;
 					if (watch.state !== "watching") return;
 					watch.polls++;
 					watch.lastOutput = output.slice(-4_000);
@@ -915,7 +1008,7 @@ export default function (pi: ExtensionAPI) {
 						onDeadline();
 						return;
 					}
-					const met = pattern ? pattern.test(output) : code === 0;
+					const met = !timedOut && (pattern ? pattern.test(output) : code === 0);
 					if (met) {
 						settleWatch(
 							watch,
@@ -1010,6 +1103,7 @@ export default function (pi: ExtensionAPI) {
 		nudgeTimer = undefined;
 		pendingLines = [];
 		await Promise.allSettled(activePolls);
+		await Promise.allSettled([...running.values()].map((entry) => entry.ready));
 
 		let survivors = 0;
 		const closing: Promise<void>[] = [];

@@ -108,6 +108,25 @@ test("session shutdown kills a keepAlive entry that was already stopping", { tim
   assert.equal(processAlive(workerPid), false);
 });
 
+test("session shutdown owns a bg_start that is still awaiting its spawn event", { timeout: 4_000 }, async (t) => {
+  const { dir, pidFile } = makeIgnoringWorker();
+  const harness = createHarness({ cwd: dir });
+  let workerPid: number | undefined;
+  t.after(() => cleanWorker(harness, dir, workerPid));
+
+  const starting = harness.execute("bg_start", {
+    command: `cd "${dir}" && node worker.mjs`,
+    name: "pending-start",
+  });
+  const shuttingDown = harness.shutdown();
+  await Promise.allSettled([starting, shuttingDown]);
+  for (let attempt = 0; attempt < 50 && !fs.existsSync(pidFile); attempt++) await delay(20);
+  if (fs.existsSync(pidFile)) workerPid = Number(fs.readFileSync(pidFile, "utf8"));
+
+  assert.equal(resultText(await harness.execute("bg_list")), "Nothing running.");
+  if (workerPid !== undefined) assert.equal(processAlive(workerPid), false);
+});
+
 test("background logs are owner-only", async (t) => {
   const harness = createHarness();
   t.after(() => harness.shutdown());
@@ -134,6 +153,20 @@ test("an exited shell leader does not announce exit while its process group is a
   assert.equal(harness.notifications.length, 0);
   assert.match(resultText(await harness.execute("bg_list")), new RegExp(`${id}.*running`));
   await harness.execute("bg_stop", { id });
+});
+
+test("group completion duration includes descendants after the shell leader exits", { timeout: 5_000 }, async (t) => {
+  const harness = createHarness();
+  t.after(() => harness.shutdown());
+  await harness.execute("bg_start", {
+    command: "sleep 1.2 & echo leader-done",
+    name: "duration-descendant",
+  });
+  await waitFor(() => harness.notifications.length === 1, 4_000);
+
+  const body = harness.notifications[0]?.message.content ?? "";
+  assert.match(body, /exited 0 after/);
+  assert.doesNotMatch(body, /after 0s/);
 });
 
 test("exited process history is pruned when children close", { timeout: 5_000 }, async (t) => {
